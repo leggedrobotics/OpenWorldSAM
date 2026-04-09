@@ -25,7 +25,7 @@ import logging
 
 @META_ARCH_REGISTRY.register()
 class OpenWorldSAM2(nn.Module):
-    TIMING_ENABLED = True  # Set to False in production to skip cuda sync overhead
+    TIMING_ENABLED = os.environ.get("OWSAM_TIMING", "1") == "1"  # Set OWSAM_TIMING=0 to skip cuda sync overhead
 
     @configurable
     def __init__(
@@ -611,7 +611,8 @@ class OpenWorldSAM2(nn.Module):
 
 
             if not self.training:
-                torch.cuda.synchronize()
+                if self.TIMING_ENABLED:
+                    torch.cuda.synchronize()
                 timings["postprocess"] += time.perf_counter() - t0
                 self._last_timings = timings
                 return processed_results

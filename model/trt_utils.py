@@ -386,6 +386,8 @@ class _TRTDecoderAdapter(nn.Module):
         repeat_image: bool = True,               # ignored — baked as True
         high_res_features=None,
     ):
+        assert high_res_features is not None and len(high_res_features) >= 2, \
+            "_TRTDecoderAdapter requires high_res_features (got None)"
         low_res_masks, iou_pred = self.trt_wrapper(
             image_embeddings,
             image_pe,
