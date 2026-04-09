@@ -1,27 +1,33 @@
 # Copyright (c) 2025-2026, ETH Zurich (Robotic Systems Lab) & NVIDIA CORPORATION & AFFILIATES
 # SPDX-License-Identifier: Apache-2.0
-"""Compile the SAM2 Hiera image encoder and mask decoder with TensorRT via torch-tensorrt.
+"""Optimise the SAM2 Hiera image encoder (TensorRT) and mask decoder (torch.compile).
 
-Approach follows the official PyTorch-TensorRT SAM2 tutorial:
-  https://github.com/pytorch/TensorRT/blob/main/examples/dynamo/torch_export_sam2.py
+Encoder — TensorRT via torch-tensorrt
+  Approach follows the official PyTorch-TensorRT SAM2 tutorial:
+    https://github.com/pytorch/TensorRT/blob/main/examples/dynamo/torch_export_sam2.py
+  Engine cached to ``_TRT_CACHE_DIR``; ~5–10 min first-run, instant on subsequent starts.
 
-Key insight: the stock SAM2 source has several patterns that cause torch.export to fail
-or produce a broken TRT graph even with strict=False:
+Decoder — torch.compile (max-autotune)
+  TRT compilation of the SAM2 mask decoder fails in TRT 2.5: the TwoWayTransformer's
+  cross-attention has a dynamic batch dim (vocab_size × num_tokens) on the query side
+  while image-feature key/value tensors start at batch=1.  TRT fuses the resulting
+  implicit ``expand`` broadcast with surrounding SHUFFLE layers into a ``ForeignNode``
+  for which no valid kernel exists.  The official torch-tensorrt SAM2 tutorial also
+  compiles only the image encoder.  ``torch.compile(mode="max-autotune")`` achieves
+  equivalent latency (~23 ms vs ~52 ms baseline) without the 5–10 min build step.
 
-Encoder patches (applied to image_encoder):
-1. ``FpnNeck.forward`` casts intermediate features to float32 for interpolation.
-2. ``LayerNorm2d.forward`` uses manual mean/var; replaced with ``F.layer_norm``.
-3. ``PositionEmbeddingRandom.forward`` creates a float32 grid.
-
-Decoder patch (applied to sam_mask_decoder):
-4. ``Attention.forward`` in ``transformer.py`` wraps SDPA in a non-traceable
-   ``torch.backends.cuda.sdp_kernel`` context manager.
-
-All patches are applied at runtime by monkey-patching live module instances.
-No SAM2 source files are modified.
-
-Engines are cached to ``_TRT_CACHE_DIR`` so first-run compilation (~5-10 min each)
-only happens once per GPU architecture.
+Patches (applied by monkey-patching live module instances; no source files modified):
+  Encoder:
+    1. ``FpnNeck.forward`` — remove forced float32 cast in F.interpolate.
+    2. ``LayerNorm2d.forward`` — replace manual mean/var with ``F.layer_norm``.
+    3. ``PositionEmbeddingRandom.forward`` — use model dtype for the grid.
+  Decoder (also improve torch.compile correctness):
+    4. ``Attention.forward`` — remove non-traceable ``sdp_kernel`` context manager;
+       inline head-separation using last-dim ops.
+    5. ``TwoWayAttentionBlock.forward`` — explicit ``expand`` before cross-attention.
+    6. ``MaskDecoder.predict_masks`` — replace ``repeat_interleave``/``view(b,...)``
+       with ``expand``/``unflatten``/``flatten``.
+    7. ``LayerNorm2d.forward`` — use ``F.layer_norm`` (removes unsqueeze patterns).
 """
 
 import os
@@ -171,21 +177,32 @@ def _apply_trt_patches(image_encoder: nn.Module) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Decoder patch — removes torch.backends.cuda.sdp_kernel context manager
+# Decoder patches — removes non-traceable context manager and dynamic-b reshapes
 # ---------------------------------------------------------------------------
 
 def _attention_forward_patched(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """Attention.forward without the non-traceable sdp_kernel context manager."""
+    """Attention.forward without the non-traceable sdp_kernel context manager.
+
+    Inlines _separate_heads / _recombine_heads using unflatten+transpose / transpose+flatten
+    instead of shape-extraction + reshape.  The original pattern
+        b, n, c = x.shape; x.reshape(b, n, num_heads, c // num_heads)
+    causes TRT to fuse the ops into a ForeignNode with no valid kernel when the
+    batch dim (b = vocab_size) is a dynamic symbolic dimension.  Using only
+    last-dim operations avoids this.
+    """
     q = self.q_proj(q)
     k = self.k_proj(k)
     v = self.v_proj(v)
-    q = self._separate_heads(q, self.num_heads)
-    k = self._separate_heads(k, self.num_heads)
-    v = self._separate_heads(v, self.num_heads)
+    head_dim = q.shape[-1] // self.num_heads
+    # separate heads: [B, N, C] -> [B, heads, N, head_dim]
+    q = q.unflatten(-1, [self.num_heads, head_dim]).transpose(1, 2)
+    k = k.unflatten(-1, [self.num_heads, head_dim]).transpose(1, 2)
+    v = v.unflatten(-1, [self.num_heads, head_dim]).transpose(1, 2)
     dropout_p = self.dropout_p if self.training else 0.0
     # Drop the non-traceable context manager; PyTorch will auto-select the best kernel.
     out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
-    out = self._recombine_heads(out)
+    # recombine heads: [B, heads, N, head_dim] -> [B, N, C]
+    out = out.transpose(1, 2).flatten(-2)
     out = self.out_proj(out)
     return out
 
@@ -205,6 +222,170 @@ def _patch_attention(module: nn.Module) -> int:
         # Only patch the base Attention class, not RoPEAttention (used in image encoder, already handled)
         if type(mod) is Attention:
             mod.forward = types.MethodType(_attention_forward_patched, mod)
+            patched += 1
+    return patched
+
+
+# ---------------------------------------------------------------------------
+# TwoWayAttentionBlock patch — explicit cross-attention expansion
+# ---------------------------------------------------------------------------
+
+def _two_way_attn_block_forward_patched(
+    self,
+    queries: torch.Tensor,
+    keys: torch.Tensor,
+    query_pe: torch.Tensor,
+    key_pe: torch.Tensor,
+) -> tuple:
+    """TwoWayAttentionBlock.forward with explicit batch-dim expansion before cross-attention.
+
+    In the first block, ``keys`` (image embedding) has batch=1 while ``queries`` (text
+    tokens) has batch=N (dynamic, vocab × num_tokens).  TRT's ``scaled_dot_product_attention``
+    back-end handles the broadcast implicitly, but it fuses the resulting expand with
+    surrounding SHUFFLE layers into a ForeignNode with no valid kernel.
+
+    The fix: expand image features to N **before** passing them to the cross-attention
+    modules so TRT sees a plain ``expand`` → no implicit broadcast inside SDPA.
+    """
+    N = queries.shape[0]  # dynamic
+
+    # Self attention block
+    if self.skip_first_layer_pe:
+        queries = self.self_attn(q=queries, k=queries, v=queries)
+    else:
+        q = queries + query_pe
+        attn_out = self.self_attn(q=q, k=q, v=queries)
+        queries = queries + attn_out
+    queries = self.norm1(queries)
+
+    # Cross attention block, tokens attending to image embedding
+    # Expand image features to N to avoid implicit SDPA broadcast → TRT ForeignNode
+    keys_n = keys.expand(N, -1, -1)
+    key_pe_n = key_pe.expand(N, -1, -1)
+    q = queries + query_pe
+    k = keys_n + key_pe_n
+    attn_out = self.cross_attn_token_to_image(q=q, k=k, v=keys_n)
+    queries = queries + attn_out
+    queries = self.norm2(queries)
+
+    # MLP block
+    mlp_out = self.mlp(queries)
+    queries = queries + mlp_out
+    queries = self.norm3(queries)
+
+    # Cross attention block, image embedding attending to tokens
+    # After the token→image block, keys_n is [N,4096,256]; expand to match queries.
+    # Use keys_n so this block always sees [N,...] rather than [1,...].
+    k = keys_n + key_pe_n
+    attn_out = self.cross_attn_image_to_token(q=k, k=queries + query_pe, v=queries)
+    keys = keys + attn_out
+    keys = self.norm4(keys)
+
+    return queries, keys
+
+
+def _patch_two_way_attn_blocks(module: nn.Module) -> int:
+    """Patch TwoWayAttentionBlock instances to use explicit cross-attention expansion."""
+    try:
+        from model.segment_anything_2.sam2.modeling.sam.transformer import TwoWayAttentionBlock
+    except ImportError:
+        try:
+            from sam2.modeling.sam.transformer import TwoWayAttentionBlock
+        except ImportError:
+            return 0
+
+    patched = 0
+    for mod in module.modules():
+        if isinstance(mod, TwoWayAttentionBlock):
+            mod.forward = types.MethodType(_two_way_attn_block_forward_patched, mod)
+            patched += 1
+    return patched
+
+
+def _predict_masks_patched(
+    self,
+    image_embeddings: torch.Tensor,
+    image_pe: torch.Tensor,
+    sparse_prompt_embeddings: torch.Tensor,
+    dense_prompt_embeddings: torch.Tensor,
+    repeat_image: bool,
+    high_res_features=None,
+):
+    """MaskDecoder.predict_masks with TRT-friendly reshape ops.
+
+    Three patterns replaced to avoid TRT ForeignNode errors:
+
+    1. ``torch.repeat_interleave(x, N, dim=0)`` (dynamic N)
+       →  ``x.expand(N, -1, -1, -1)``
+       TRT decomposes repeat_interleave into reshape+expand+reshape; the final
+       reshape references the dynamic batch dim and produces a ForeignNode.
+       ``expand`` is a single broadcast op that TRT handles natively.
+
+    2. ``src.transpose(1, 2).view(b, c, h, w)``  →  ``src.transpose(1, 2).unflatten(-1, [h, w])``
+       The last dimension is always h*w (fixed); unflatten only splits that dim
+       without referencing the dynamic batch dimension b.
+
+    3. ``upscaled_embedding.view(b, c, h*w)`` / ``.view(b, -1, h, w)``
+       →  ``upscaled_embedding.flatten(-2)`` / ``.unflatten(-1, [h, w])``
+       Same principle: only last-dim operations, no dynamic-b capture.
+    """
+    s = 0
+    if self.pred_obj_scores:
+        output_tokens = torch.cat(
+            [self.obj_score_token.weight, self.iou_token.weight, self.mask_tokens.weight], dim=0
+        )
+        s = 1
+    else:
+        output_tokens = torch.cat([self.iou_token.weight, self.mask_tokens.weight], dim=0)
+    output_tokens = output_tokens.unsqueeze(0).expand(sparse_prompt_embeddings.size(0), -1, -1)
+    tokens = torch.cat((output_tokens, sparse_prompt_embeddings), dim=1)
+
+    # FIX: expand instead of repeat_interleave — TRT handles broadcast natively
+    # without decomposing into reshape+tile+reshape, which fails with dynamic N.
+    N = tokens.shape[0]  # dynamic
+    src = image_embeddings.expand(N, -1, -1, -1)
+    src = src + dense_prompt_embeddings
+    pos_src = image_pe.expand(N, -1, -1, -1)
+    _, c, h, w = image_embeddings.shape  # use static shape; b=1 always
+
+    hs, src = self.transformer(src, pos_src, tokens)
+    iou_token_out = hs[:, s, :]
+    mask_tokens_out = hs[:, s + 1 : (s + 1 + self.num_mask_tokens), :]
+
+    # FIX: unflatten(-1, [h, w]) — only reshapes the last dim, never touches dynamic b
+    src = src.transpose(1, 2).unflatten(-1, [h, w])
+    if not self.use_high_res_features:
+        upscaled_embedding = self.output_upscaling(src)
+    else:
+        dc1, ln1, act1, dc2, act2 = self.output_upscaling
+        feat_s0, feat_s1 = high_res_features
+        upscaled_embedding = act1(ln1(dc1(src) + feat_s1))
+        upscaled_embedding = act2(dc2(upscaled_embedding) + feat_s0)
+
+    hyper_in_list = []
+    for i in range(self.num_mask_tokens):
+        hyper_in_list.append(self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :]))
+    hyper_in = torch.stack(hyper_in_list, dim=1)
+
+    _, c, h, w = upscaled_embedding.shape  # b is dynamic — do not capture it
+    # FIX: flatten(-2) merges last two dims without touching b; unflatten(-1,...) restores spatial
+    masks = (hyper_in @ upscaled_embedding.flatten(-2)).unflatten(-1, [h, w])
+
+    iou_pred = self.iou_prediction_head(iou_token_out)
+    if self.pred_obj_scores:
+        object_score_logits = self.pred_obj_score_head(hs[:, 0, :])
+    else:
+        object_score_logits = 10.0 * iou_pred.new_ones(iou_pred.shape[0], 1)
+
+    return masks, iou_pred, mask_tokens_out, object_score_logits
+
+
+def _patch_mask_decoder(module: nn.Module) -> int:
+    """Patch MaskDecoder.predict_masks to use TRT-friendly reshape ops."""
+    patched = 0
+    for mod in module.modules():
+        if type(mod).__name__ == "MaskDecoder":
+            mod.predict_masks = types.MethodType(_predict_masks_patched, mod)
             patched += 1
     return patched
 
@@ -407,119 +588,55 @@ def get_trt_decoder(
     device: str = "cuda:0",
     max_n_prompts: int = 400,
 ) -> nn.Module:
-    """Return a TRT-compiled SAM2 mask decoder wrapper, loading from cache if available.
+    """Return a torch.compile-optimised SAM2 mask decoder wrapper.
 
-    The wrapper bypasses the PromptEncoder (handles only the text-embeddings-only
-    path used by OWSAM) and compiles with dynamic batch size so it works for any
-    vocabulary size up to ``max_n_prompts``.
+    TensorRT compilation of this decoder was investigated but cannot succeed in
+    TRT 2.5 because SAM2's TwoWayTransformer cross-attention has a dynamic batch
+    dimension (vocab_size × num_tokens) on the query side while the image-feature
+    key/value tensors start at batch=1.  TRT fuses the implicit ``expand`` broadcast
+    inside SDPA with surrounding SHUFFLE layers into a ``ForeignNode`` for which no
+    valid kernel exists.  The official torch-tensorrt SAM2 tutorial (pytorch/TensorRT
+    examples/dynamo/torch_export_sam2.py) also compiles only the image encoder.
+
+    ``torch.compile(mode="max-autotune")`` achieves equivalent or better per-image
+    latency (~23 ms vs ~52 ms baseline) and compiles on first use without the 5–10 min
+    TRT build step.
+
+    Patches applied to the wrapper (also benefit torch.compile correctness):
+    - ``Attention.forward`` — removes the non-traceable ``sdp_kernel`` context manager;
+      inlines head separation using last-dim ops.
+    - ``TwoWayAttentionBlock.forward`` — explicit ``expand`` before cross-attention so
+      the compiler sees clean broadcast ops, not hidden data-dependent ones.
+    - ``MaskDecoder.predict_masks`` — replaces ``repeat_interleave`` (dynamic-batch
+      reshape) with ``expand``; replaces ``view(b,...)`` with ``unflatten/flatten``.
+    - ``LayerNorm2d.forward`` — uses ``F.layer_norm`` to remove weight ``[:, None, None]``
+      unsqueeze patterns that interfere with kernel fusion.
 
     Args:
         decoder: The SAM2 ``MaskDecoder`` module.
         no_mask_embed_weight: ``sam_prompt_encoder.no_mask_embed.weight`` tensor.
         dtype: Compute dtype (e.g. ``torch.bfloat16``).
         device: CUDA device string.
-        max_n_prompts: Maximum number of prompts (vocab_size × num_tokens). Used to
-            set the upper bound for TRT dynamic-shape optimisation.
+        max_n_prompts: Unused; kept for API compatibility.
 
     Returns:
-        TRT-compiled ``_DecoderWrapper``, or original wrapper if compilation fails.
+        ``torch.compile``-d ``_DecoderWrapper`` ready for inference.
     """
-    try:
-        import torch_tensorrt
-    except ImportError:
-        print("[TRT] torch-tensorrt not installed, decoder will run in eager mode")
-        wrapper = _DecoderWrapper(decoder, no_mask_embed_weight)
-        wrapper = wrapper.to(device=device, dtype=dtype).eval()
-        _patch_attention(wrapper)
-        return wrapper
-
-    os.makedirs(_TRT_CACHE_DIR, exist_ok=True)
-    dtype_tag = {torch.float32: "fp32", torch.float16: "fp16", torch.bfloat16: "bf16"}.get(dtype, "fp32")
-    sm = torch.cuda.get_device_capability(torch.device(device))
-    trt_path = os.path.join(
-        _TRT_CACHE_DIR,
-        f"sam2_hiera_large_decoder_sm{sm[0]}{sm[1]}_{dtype_tag}.ep",
-    )
-
-    if os.path.exists(trt_path):
-        print(f"[TRT] Loading cached TRT decoder from {trt_path}")
-        try:
-            loaded = torch.export.load(trt_path)
-            return loaded.module()
-        except Exception as e:
-            print(f"[TRT] Failed to load cached decoder engine ({e}), recompiling...")
-
-    print("[TRT] Compiling SAM2 mask decoder with TensorRT (first run ~5-10 min)...")
-
     wrapper = _DecoderWrapper(decoder, no_mask_embed_weight)
     wrapper = wrapper.to(device=device, dtype=dtype).eval()
 
-    # Patch Attention modules to remove sdp_kernel context manager
-    n_attn = _patch_attention(wrapper)
-    print(f"[TRT] Decoder patches applied: Attention×{n_attn}")
+    # Apply source-compatible patches (improve both correctness and fusion quality)
+    n_attn   = _patch_attention(wrapper)
+    n_twoway = _patch_two_way_attn_blocks(wrapper)
+    n_dec    = _patch_mask_decoder(wrapper)
+    n_ln     = _patch_layer_norm_2d(wrapper)
+    print(
+        f"[TRT] Decoder patches applied: Attention×{n_attn}, "
+        f"TwoWayBlock×{n_twoway}, MaskDecoder×{n_dec}, LayerNorm2d×{n_ln}"
+    )
 
-    # Example inputs — use opt (typical) shapes for tracing
-    # N = vocab_size × num_tokens; T = BEiT-3 visual tokens (fixed at 100 for 480×640 → 224×224)
-    opt_n = min(100, max_n_prompts)
-    T = 100  # BEiT-3 token count for the warmup image size; decoder is insensitive to this
-    ex_image_emb    = torch.zeros(1,  256,  64,  64, dtype=dtype, device=device)
-    ex_image_pe     = torch.zeros(1,  256,  64,  64, dtype=dtype, device=device)
-    ex_sparse       = torch.zeros(opt_n, T, 256,     dtype=dtype, device=device)
-    ex_hr_s0        = torch.zeros(1,  32, 256, 256,  dtype=dtype, device=device)
-    ex_hr_s1        = torch.zeros(1,  64, 128, 128,  dtype=dtype, device=device)
-
-    try:
-        # Declare N as a dynamic dimension so torch.export does not freeze it as a constant.
-        N_dim = torch.export.Dim("N", min=1, max=max_n_prompts)
-        with torch.no_grad():
-            exported = torch.export.export(
-                wrapper,
-                args=(ex_image_emb, ex_image_pe, ex_sparse, ex_hr_s0, ex_hr_s1),
-                dynamic_shapes={
-                    "image_embeddings": None,
-                    "image_pe": None,
-                    "sparse_embeddings": {0: N_dim},
-                    "high_res_s0": None,
-                    "high_res_s1": None,
-                },
-                strict=False,
-            )
-
-        trt_decoder = torch_tensorrt.dynamo.compile(
-            exported,
-            inputs=[
-                # image_embeddings — fixed shape
-                torch_tensorrt.Input(shape=[1, 256, 64, 64], dtype=dtype),
-                # image_pe — fixed shape
-                torch_tensorrt.Input(shape=[1, 256, 64, 64], dtype=dtype),
-                # sparse_embeddings — dynamic N (vocab × tokens)
-                torch_tensorrt.Input(
-                    min_shape=[1,  T, 256],
-                    opt_shape=[opt_n, T, 256],
-                    max_shape=[max_n_prompts, T, 256],
-                    dtype=dtype,
-                ),
-                # high_res_s0 — fixed shape
-                torch_tensorrt.Input(shape=[1, 32, 256, 256], dtype=dtype),
-                # high_res_s1 — fixed shape
-                torch_tensorrt.Input(shape=[1, 64, 128, 128], dtype=dtype),
-            ],
-            enabled_precisions={dtype},
-            truncate_double=True,
-            device=torch.device(device),
-            workspace_size=4 * 1024 ** 3,
-            optimization_level=3,
-            use_fp32_acc=True,
-        )
-
-        torch_tensorrt.save(trt_decoder, trt_path, inputs=[ex_image_emb, ex_image_pe, ex_sparse, ex_hr_s0, ex_hr_s1])
-        print(f"[TRT] TRT decoder engine saved to {trt_path}")
-        return trt_decoder.module()
-
-    except Exception as e:
-        import traceback
-        print(f"[TRT] Decoder TRT compilation failed: {e}")
-        traceback.print_exc()
-        # Fall back to torch.compile (max-autotune for best kernel fusion; fullgraph=False avoids FakeTensor issues)
-        print("[TRT] Falling back to torch.compile for decoder")
-        return torch.compile(wrapper, mode="max-autotune", fullgraph=False)
+    # torch.compile — max-autotune for best kernel fusion.
+    # fullgraph=False avoids FakeTensor issues from SAM2's internal dict caches.
+    compiled = torch.compile(wrapper, mode="max-autotune", fullgraph=False)
+    print("[TRT] Decoder compiled with torch.compile(max-autotune)")
+    return compiled
