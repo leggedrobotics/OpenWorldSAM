@@ -7,14 +7,16 @@ Encoder — TensorRT via torch-tensorrt
     https://github.com/pytorch/TensorRT/blob/main/examples/dynamo/torch_export_sam2.py
   Engine cached to ``_TRT_CACHE_DIR``; ~5–10 min first-run, instant on subsequent starts.
 
-Decoder — torch.compile (max-autotune)
+Decoder — torch.compile (default)
   TRT compilation of the SAM2 mask decoder fails in TRT 2.5: the TwoWayTransformer's
   cross-attention has a dynamic batch dim (vocab_size × num_tokens) on the query side
   while image-feature key/value tensors start at batch=1.  TRT fuses the resulting
   implicit ``expand`` broadcast with surrounding SHUFFLE layers into a ``ForeignNode``
   for which no valid kernel exists.  The official torch-tensorrt SAM2 tutorial also
-  compiles only the image encoder.  ``torch.compile(mode="max-autotune")`` achieves
-  equivalent latency (~23 ms vs ~52 ms baseline) without the 5–10 min build step.
+  compiles only the image encoder.  ``torch.compile(mode="default")`` achieves good
+  per-frame latency (~23 ms vs ~52 ms baseline) while keeping recompilation for new
+  vocabulary sizes cheap (~5–10 ms vs ~200 ms for max-autotune).  This avoids latency
+  spikes when ``--lmm_per_image`` generates vocabulary sizes outside the warmup range.
 
 Patches (applied by monkey-patching live module instances; no source files modified):
   Encoder:
@@ -598,9 +600,11 @@ def get_trt_decoder(
     valid kernel exists.  The official torch-tensorrt SAM2 tutorial (pytorch/TensorRT
     examples/dynamo/torch_export_sam2.py) also compiles only the image encoder.
 
-    ``torch.compile(mode="max-autotune")`` achieves equivalent or better per-image
-    latency (~23 ms vs ~52 ms baseline) and compiles on first use without the 5–10 min
-    TRT build step.
+    ``torch.compile(mode="default")`` achieves good per-image latency (~23 ms vs
+    ~52 ms baseline) while keeping recompilation for unseen vocabulary sizes cheap
+    (~5–10 ms).  ``max-autotune`` was tried but causes ~200 ms Triton autotuning
+    spikes whenever ``--lmm_per_image`` generates a vocabulary size not covered by
+    the startup warmup.
 
     Patches applied to the wrapper (also benefit torch.compile correctness):
     - ``Attention.forward`` — removes the non-traceable ``sdp_kernel`` context manager;
@@ -635,8 +639,11 @@ def get_trt_decoder(
         f"TwoWayBlock×{n_twoway}, MaskDecoder×{n_dec}, LayerNorm2d×{n_ln}"
     )
 
-    # torch.compile — max-autotune for best kernel fusion.
+    # torch.compile — "default" mode keeps recompilation for unseen vocabulary sizes
+    # cheap (~5–10 ms) at the cost of ~6 ms/frame vs max-autotune.  max-autotune
+    # causes ~200 ms Triton kernel-search spikes for every new vocab size encountered
+    # at runtime (e.g. from --lmm_per_image), which far outweighs the per-frame gain.
     # fullgraph=False avoids FakeTensor issues from SAM2's internal dict caches.
-    compiled = torch.compile(wrapper, mode="max-autotune", fullgraph=False)
-    print("[TRT] Decoder compiled with torch.compile(max-autotune)")
+    compiled = torch.compile(wrapper, mode="default", fullgraph=False)
+    print("[TRT] Decoder compiled with torch.compile(default)")
     return compiled
