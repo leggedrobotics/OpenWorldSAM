@@ -67,10 +67,17 @@ def _triton_available() -> bool:
     if not any(os.path.isfile(p) for p in cuda_h_candidates):
         return False
     # 2. ptxas — PTX assembler called by Triton to produce GPU binaries.
-    if shutil.which("ptxas") is None:
-        ptxas_path = os.path.join(cuda_home, "bin", "ptxas")
-        if not os.path.isfile(ptxas_path):
-            return False
+    # Triton checks TRITON_PTXAS_PATH first, then falls back to PATH search.
+    # On aarch64 JetPack its PATH search is unreliable, so auto-set the env var
+    # here when it is absent — Triton reads os.environ at compile time.
+    ptxas_path = (
+        os.environ.get("TRITON_PTXAS_PATH")
+        or shutil.which("ptxas")
+        or os.path.join(cuda_home, "bin", "ptxas")
+    )
+    if not os.path.isfile(ptxas_path):
+        return False
+    os.environ.setdefault("TRITON_PTXAS_PATH", ptxas_path)
     return True
 
 
