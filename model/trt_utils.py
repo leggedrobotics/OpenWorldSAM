@@ -265,27 +265,31 @@ class _InductorWithCudagraphsFallback(torch.nn.Module):
 def _torch_compile(module: torch.nn.Module, *, mode: str = "default", fullgraph: bool = False) -> torch.nn.Module:
     """Compile ``module`` with the best available backend.
 
-    On Jetson (detected via ``/etc/nv_tegra_release``), ``threading.RLock``
-    objects inside BEiT-3 / torchscale are captured as constants by dynamo and
-    are not picklable by torch's internal Pickler, which bypasses
-    ``copyreg.dispatch_table`` — so ``copyreg.pickle`` registration alone does not
-    work.  The FIRST forward pass (not the ``torch.compile()`` call — compilation
-    is lazy) triggers inductor to pickle these constants when writing kernel
-    artefacts to its temp dir and sending work to its subprocess pool.
+    On Jetson aarch64 with PyTorch ≥ 2.6, inductor's Triton kernel compilation
+    uses worker *processes* (not threads) for parallelism.  CUDA + ``fork`` is
+    unsafe on aarch64, so PyTorch forces the ``spawn`` start method, which
+    requires pickling every compilation task including all constants captured from
+    the FX graph during dynamo tracing.  ``_thread.RLock`` objects inside BEiT-3
+    / torchscale (in ``lru_cache`` wrappers, closures, and class-level attributes)
+    appear as captured constants and cannot be pickled — causing
+    ``TypeError: cannot pickle '_thread.RLock' object`` at the FIRST forward pass
+    (``torch.compile()`` is lazy; compilation happens at inference time).
 
-    Primary fix: ``_replace_rlocks_in_module`` walks the module before compilation
-    and replaces every ``_thread.RLock`` with a ``_PicklableRLock`` wrapper that
-    defines ``__reduce__``.  Python's pickle protocol always calls ``__reduce_ex__``
-    on the object itself, which no custom Pickler can bypass, so this fix is robust
-    regardless of which internal Pickler torch uses.
+    On PyTorch 2.5.1 x86 (the desktop server build), the worker pool uses
+    ``fork`` and no serialisation is required, so the error never appears there.
 
-    Belt-and-suspenders: inductor / AOT-autograd disk caches are also disabled to
-    reduce the total amount of pickling, and the returned module is wrapped in
-    ``_InductorWithCudagraphsFallback`` to catch any remaining pickle error that
-    surfaces at inference time and transparently switch to the ``cudagraphs`` backend.
+    Fix: ``compile_threads=1`` forces single-threaded in-process Triton
+    compilation — no subprocess, no IPC, no pickle.  The RLock problem is
+    sidestepped entirely; no need to traverse and replace every lock hidden in
+    closures or ``lru_cache`` wrappers.  Serial compilation only affects the
+    first inference call; steady-state throughput is unchanged.
+
+    Belt-and-suspenders: disk caches are also disabled, and the returned module
+    is wrapped in ``_InductorWithCudagraphsFallback`` to transparently fall back
+    to ``cudagraphs`` if any pickle path we missed still fires.
 
     Priority:
-      1. Jetson + Triton → ``inductor`` (RLocks replaced, dynamic=True, caches off).
+      1. Jetson + Triton → ``inductor`` (compile_threads=1, dynamic=True, caches off).
       2. Jetson, inductor still fails → ``cudagraphs`` (via ``_InductorWithCudagraphsFallback``).
       3. Non-Jetson, Triton available → ``inductor`` default (best kernel fusion).
       4. Non-Jetson, Triton unavailable → ``cudagraphs``.
@@ -304,18 +308,27 @@ def _torch_compile(module: torch.nn.Module, *, mode: str = "default", fullgraph:
         # suspenders to reduce the total amount of pickling that happens.
         # dynamic=True compiles one symbolic graph for all vocabulary sizes,
         # avoiding per-shape recompilation overhead.
-        # PRIMARY FIX: replace every _thread.RLock in the module with a
-        # _PicklableRLock wrapper before torch.compile() is called.  Inductor
-        # captures module attributes as FX-graph constants and pickles them when
-        # writing kernel artefacts; the native C RLock is not picklable by torch's
-        # internal Pickler (which bypasses copyreg.dispatch_table), but a Python
-        # wrapper with __reduce__ is always picklable.
-        _replace_rlocks_in_module(module)
-        _make_locks_picklable()  # belt-and-suspenders for other Pickler paths
-        # Disable all inductor / AOT-autograd disk caches to reduce pickling further.
+        # Root cause: on Jetson aarch64 with PyTorch ≥ 2.6, inductor spawns
+        # worker PROCESSES (not threads) for parallel Triton kernel compilation.
+        # CUDA + fork is unsafe on aarch64, so PyTorch uses `spawn`, which
+        # requires pickling the entire compilation task — including all constants
+        # captured from the FX graph during dynamo tracing.  BEiT-3 / torchscale
+        # store _thread.RLock objects in lru_cache wrappers, closures, and class-
+        # level attributes that appear as captured constants and cannot be pickled.
+        #
+        # On PyTorch 2.5.1 x86 (the desktop server build) the worker pool uses
+        # `fork` so no serialisation is needed, which is why the error only
+        # appears on Jetson.
+        #
+        # Fix: compile_threads=1 forces single-threaded in-process Triton
+        # compilation.  No subprocess → no IPC → no pickle.  This sidesteps
+        # the RLock problem entirely without needing to find and replace every
+        # lock hidden in closures, lru_cache wrappers, or class attributes.
+        # Compilation is serial, but that only affects the first inference call.
         try:
             import torch._inductor.config as _ic
-            _ic.fx_graph_cache = False
+            _ic.compile_threads = 1          # in-process Triton JIT, no pickle
+            _ic.fx_graph_cache = False       # no disk cache serialisation
             if hasattr(_ic, "force_disable_caches"):
                 _ic.force_disable_caches = True
             if hasattr(_ic, "autotune_local_cache"):
@@ -330,7 +343,7 @@ def _torch_compile(module: torch.nn.Module, *, mode: str = "default", fullgraph:
             pass
         try:
             compiled = torch.compile(module, mode=mode, fullgraph=fullgraph, dynamic=True)
-            print("[compile] Jetson+Triton: using torch.compile(inductor, dynamic=True, RLocks replaced)", flush=True)
+            print("[compile] Jetson+Triton: using torch.compile(inductor, dynamic=True, single-thread)", flush=True)
             # Wrap in a fallback shim: if the FIRST forward pass raises a pickle
             # error (compilation is lazy, error surfaces at inference time), we
             # transparently switch to the cudagraphs backend instead of crashing.
