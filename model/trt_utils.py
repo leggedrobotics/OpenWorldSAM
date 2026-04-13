@@ -84,33 +84,35 @@ def _triton_available() -> bool:
 def _torch_compile(module: torch.nn.Module, *, mode: str = "default", fullgraph: bool = False) -> torch.nn.Module:
     """Compile ``module`` with the best available backend.
 
-    On Jetson (detected via ``/etc/nv_tegra_release``), the ``inductor`` backend
-    fails because patched ``types.MethodType`` bindings and ``threading.RLock``
-    objects inside BEiT-3 / SAM2 are not picklable by inductor's guard-serialisation
-    step.  ``cudagraphs`` is used instead — it captures CUDA kernel launches without
-    serialising model state.
+    On Jetson (detected via ``/etc/nv_tegra_release``), dynamo's per-shape
+    recompilation triggers pickling of the module closure.  This fails because
+    ``types.MethodType`` patches on the decoder and ``threading.RLock`` objects
+    inside BEiT-3 / torchscale are not picklable.  ``dynamic=True`` compiles one
+    symbolic-shape graph that covers all vocabulary sizes, so no per-shape
+    recompilation is ever triggered and the pickling step is never reached.
+    Falls back to ``cudagraphs`` if inductor still fails.
 
     Priority:
-      1. Jetson → ``cudagraphs`` unconditionally (pickling constraint).
-      2. Non-Jetson, Triton available → ``inductor`` (best kernel fusion).
-      3. Non-Jetson, Triton unavailable → ``cudagraphs`` (no Triton needed).
-      4. Eager fallback if all backends fail.
+      1. Jetson + Triton → ``inductor`` with ``dynamic=True`` (kernel fusion, no recompile).
+      2. Jetson, inductor fails → ``cudagraphs`` (CUDA graph capture, no pickling).
+      3. Non-Jetson, Triton available → ``inductor`` default (best kernel fusion).
+      4. Non-Jetson, Triton unavailable → ``cudagraphs``.
+      5. Eager fallback if all backends fail.
     """
     _on_jetson = os.path.isfile("/etc/nv_tegra_release")
     if _on_jetson and _triton_available():
-        # On Jetson, types.MethodType patches and threading.RLock objects inside
-        # BEiT-3 / SAM2 are not picklable by inductor's guard-serialisation step.
-        # Disabling nn.Module guards avoids the pickle entirely — safe for fixed
-        # inference weights since dynamo only loses the ability to detect weight
-        # swaps at runtime (which never happens here).
+        # On Jetson, dynamo's per-shape recompilation triggers pickling of the
+        # module closure, which fails because types.MethodType patches and
+        # threading.RLock objects (inside BEiT-3 / torchscale) are not picklable.
+        # dynamic=True compiles one symbolic-shape graph covering all vocabulary
+        # sizes, so no per-shape recompilation is ever triggered and the pickling
+        # step is never reached.
         try:
-            import torch._dynamo as _dynamo
-            _dynamo.config.guard_nn_modules = False
-            compiled = torch.compile(module, mode=mode, fullgraph=fullgraph)
-            print("[compile] Jetson+Triton: using torch.compile(inductor, guard_nn_modules=False)")
+            compiled = torch.compile(module, mode=mode, fullgraph=fullgraph, dynamic=True)
+            print("[compile] Jetson+Triton: using torch.compile(inductor, dynamic=True)")
             return compiled
         except Exception as e:
-            print(f"[compile] inductor with guard_nn_modules=False failed ({e}); trying cudagraphs")
+            print(f"[compile] inductor dynamic=True failed ({e}); trying cudagraphs")
     if _on_jetson:
         try:
             compiled = torch.compile(module, backend="cudagraphs", fullgraph=fullgraph)
