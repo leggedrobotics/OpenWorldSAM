@@ -84,15 +84,30 @@ def _triton_available() -> bool:
 def _torch_compile(module: torch.nn.Module, *, mode: str = "default", fullgraph: bool = False) -> torch.nn.Module:
     """Compile ``module`` with the best available backend.
 
+    On Jetson (detected via ``/etc/nv_tegra_release``), the ``inductor`` backend
+    fails because patched ``types.MethodType`` bindings and ``threading.RLock``
+    objects inside BEiT-3 / SAM2 are not picklable by inductor's guard-serialisation
+    step.  ``cudagraphs`` is used instead — it captures CUDA kernel launches without
+    serialising model state.
+
     Priority:
-      1. ``inductor`` (default torch.compile backend) — best kernel fusion; requires Triton.
-      2. ``cudagraphs``  — captures CUDA kernel launches as a CUDA graph for replay;
-         reduces Python/driver scheduling overhead without needing Triton.
-      3. Eager fallback  — returned unmodified if both backends fail.
+      1. Jetson → ``cudagraphs`` unconditionally (pickling constraint).
+      2. Non-Jetson, Triton available → ``inductor`` (best kernel fusion).
+      3. Non-Jetson, Triton unavailable → ``cudagraphs`` (no Triton needed).
+      4. Eager fallback if all backends fail.
     """
+    _on_jetson = os.path.isfile("/etc/nv_tegra_release")
+    if _on_jetson:
+        try:
+            compiled = torch.compile(module, backend="cudagraphs", fullgraph=fullgraph)
+            print("[compile] Jetson: using torch.compile(cudagraphs)")
+            return compiled
+        except Exception as e:
+            print(f"[compile] cudagraphs failed ({e}); running in eager mode")
+            return module
     if _triton_available():
         return torch.compile(module, mode=mode, fullgraph=fullgraph)
-    # Triton unavailable (e.g. Jetson ARM) — try cudagraphs which needs no Triton.
+    # Non-Jetson but Triton unavailable — try cudagraphs before giving up.
     try:
         compiled = torch.compile(module, backend="cudagraphs", fullgraph=fullgraph)
         print("[compile] Triton unavailable; using torch.compile(cudagraphs) fallback")
@@ -703,14 +718,6 @@ def get_trt_decoder(
     # causes ~200 ms Triton kernel-search spikes for every new vocab size encountered
     # at runtime (e.g. from --lmm_per_image), which far outweighs the per-frame gain.
     # fullgraph=False avoids FakeTensor issues from SAM2's internal dict caches.
-    # On Jetson the patched methods (types.MethodType) bound onto the decoder are not
-    # picklable, so the inductor backend fails with "cannot pickle '_thread.RLock'".
-    # Use cudagraphs (no model-state serialisation) on Jetson only.
-    _on_jetson = os.path.isfile("/etc/nv_tegra_release")
-    if _on_jetson:
-        compiled = torch.compile(wrapper, backend="cudagraphs", fullgraph=False)
-        print("[TRT] Decoder compiled with torch.compile(cudagraphs, Jetson)")
-    else:
-        compiled = _torch_compile(wrapper, mode="default", fullgraph=False)
-        print("[TRT] Decoder compiled with torch.compile(default)")
+    compiled = _torch_compile(wrapper, mode="default", fullgraph=False)
+    print("[TRT] Decoder compiled")
     return compiled
