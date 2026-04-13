@@ -81,26 +81,124 @@ def _triton_available() -> bool:
     return True
 
 
+import threading as _threading_mod
+
+
+class _PicklableRLock:
+    """A ``threading.RLock`` wrapper that is picklable by ANY pickler, including
+    torch's internal Pickler subclass.
+
+    Root cause of ``TypeError: cannot pickle '_thread.RLock' object``:
+
+    When ``torch.compile(backend='inductor')`` runs its first forward pass, the
+    inductor backend serialises the compiled FX graph's ``constants`` dict (which
+    contains objects captured as constants during dynamo tracing — including any
+    ``_thread.RLock`` objects stored as module attributes) to write compilation
+    artefacts to a temp directory and/or send them to worker processes via pickle.
+
+    ``copyreg.dispatch_table`` is checked FIRST in Python's standard ``Pickler``,
+    so ``copyreg.pickle(_thread.RLock, ...)`` would normally work — but torch's
+    internal Pickler subclass supplies its own ``dispatch_table`` that does NOT
+    include the copyreg entries, so the registration is silently ignored.
+
+    Python's pickle protocol ALWAYS calls ``obj.__reduce_ex__()`` on the object
+    itself as a fallback; this step cannot be bypassed by a custom Pickler.
+    Replacing the actual ``_thread.RLock`` objects with instances of this wrapper
+    class (which defines ``__reduce__``) therefore works regardless of which
+    Pickler torch uses internally.
+
+    All threading semantics (acquire / release / context-manager) are fully
+    preserved by delegating to an underlying ``_thread.RLock``.
+    """
+
+    __slots__ = ("_lock",)
+
+    def __init__(self):
+        self._lock = _threading_mod.RLock()
+
+    # Pickle support — produce a fresh unlocked instance on unpickle.
+    # torch only pickles for cache-key purposes and never restores lock state.
+    def __reduce__(self):
+        return (type(self), ())
+
+    def acquire(self, blocking=True, timeout=-1):
+        return self._lock.acquire(blocking=blocking, timeout=timeout)
+
+    def release(self):
+        return self._lock.release()
+
+    def __enter__(self):
+        return self._lock.__enter__()
+
+    def __exit__(self, *args):
+        return self._lock.__exit__(*args)
+
+    def _is_owned(self):
+        # Used internally by threading.Condition
+        return self._lock._is_owned()
+
+
+def _replace_rlocks_in_module(module: torch.nn.Module) -> None:
+    """Recursively replace every ``_thread.RLock`` in *module* with a
+    ``_PicklableRLock`` wrapper.
+
+    Inductor captures module attributes (including locks used for thread-safe
+    caching in BEiT-3 / torchscale) as constants in the compiled FX graph and
+    then pickles them when writing compilation artefacts.  Replacing the native
+    C-extension RLock objects with Python-level wrappers that implement
+    ``__reduce__`` makes them picklable by any Pickler.
+
+    The traversal covers:
+      * Direct ``__dict__`` attributes of every ``nn.Module`` instance.
+      * Non-Module sub-objects reachable from those dicts (e.g. cache helpers).
+      * Lists of objects that may contain locks.
+    """
+    import _thread as _t
+    _rlock_type = type(_t.RLock())  # _thread.RLock (same as type(threading.RLock()))
+    visited: set = set()
+
+    def _process(obj) -> None:
+        oid = id(obj)
+        if oid in visited:
+            return
+        visited.add(oid)
+        d = getattr(obj, "__dict__", None)
+        if not d:
+            return
+        for key, val in list(d.items()):
+            if isinstance(val, _rlock_type):
+                try:
+                    object.__setattr__(obj, key, _PicklableRLock())
+                except (AttributeError, TypeError):
+                    pass
+            elif isinstance(val, list):
+                for i, item in enumerate(val):
+                    if isinstance(item, _rlock_type):
+                        val[i] = _PicklableRLock()
+                    elif hasattr(item, "__dict__") and not isinstance(item, type):
+                        _process(item)
+            elif hasattr(val, "__dict__") and not isinstance(val, type):
+                _process(val)
+
+    for submod in module.modules():
+        _process(submod)
+    _process(module)  # catch non-Module sub-objects from the top level too
+
+
 def _make_locks_picklable() -> None:
-    """Register copyreg handlers so threading.RLock and threading.Lock can be pickled.
+    """Register copyreg handlers for threading locks (belt-and-suspenders).
 
-    torch.compile's inductor backend pickles module state when building
-    compilation guards.  BEiT-3 / torchscale hold ``threading.RLock`` objects
-    (e.g. for thread-safe caching) that are not picklable by default, causing
-    ``TypeError: cannot pickle '_thread.RLock' object``.
-
-    Registering a ``copyreg`` reducer makes pickle serialize them as a call to
-    their constructor, producing a new unlocked instance on unpickling.  This is
-    safe because dynamo only pickles for cache-key comparison — it never restores
-    and uses the lock state itself.
+    This is kept alongside ``_replace_rlocks_in_module`` for Pickler paths that
+    DO respect ``copyreg.dispatch_table``.  It has no effect on torch's internal
+    Pickler subclass (which supplies its own dispatch_table), so it is NOT
+    sufficient on its own — use ``_replace_rlocks_in_module`` as the primary fix.
     """
     import copyreg
     import _thread
-    import threading
 
     for lock_type, factory in [
         (_thread.RLock, _thread.RLock),
-        (type(threading.Lock()), threading.Lock),
+        (type(_threading_mod.Lock()), _threading_mod.Lock),
     ]:
         try:
             copyreg.pickle(lock_type, lambda obj, f=factory: (f, ()))
@@ -169,25 +267,26 @@ def _torch_compile(module: torch.nn.Module, *, mode: str = "default", fullgraph:
 
     On Jetson (detected via ``/etc/nv_tegra_release``), ``threading.RLock``
     objects inside BEiT-3 / torchscale are captured as constants by dynamo and
-    are not picklable by torch's internal Pickler (which bypasses
-    ``copyreg.dispatch_table``).  Two inductor caches try to pickle compiled
-    graph artifacts during the FIRST forward pass (not at ``torch.compile()``
-    call time, because compilation is lazy):
+    are not picklable by torch's internal Pickler, which bypasses
+    ``copyreg.dispatch_table`` — so ``copyreg.pickle`` registration alone does not
+    work.  The FIRST forward pass (not the ``torch.compile()`` call — compilation
+    is lazy) triggers inductor to pickle these constants when writing kernel
+    artefacts to its temp dir and sending work to its subprocess pool.
 
-      * ``FxGraphCache``     — inductor disk cache (``fx_graph_cache``).
-      * ``AOTAutogradCache`` — higher-level AOT autograd cache, enabled by
-                               default since PyTorch 2.5
-                               (``torch._functorch.config.enable_autograd_cache``).
+    Primary fix: ``_replace_rlocks_in_module`` walks the module before compilation
+    and replaces every ``_thread.RLock`` with a ``_PicklableRLock`` wrapper that
+    defines ``__reduce__``.  Python's pickle protocol always calls ``__reduce_ex__``
+    on the object itself, which no custom Pickler can bypass, so this fix is robust
+    regardless of which internal Pickler torch uses.
 
-    Both are disabled before calling ``torch.compile()``.  In addition, the
-    returned wrapper is an ``_InductorWithCudagraphsFallback`` that intercepts
-    any ``TypeError: cannot pickle`` raised during the first forward pass and
-    transparently re-compiles with the ``cudagraphs`` backend, so the model
-    continues to run even if a cache path we haven't disabled still pickles.
+    Belt-and-suspenders: inductor / AOT-autograd disk caches are also disabled to
+    reduce the total amount of pickling, and the returned module is wrapped in
+    ``_InductorWithCudagraphsFallback`` to catch any remaining pickle error that
+    surfaces at inference time and transparently switch to the ``cudagraphs`` backend.
 
     Priority:
-      1. Jetson + Triton → ``inductor`` (dynamic=True, all caches disabled).
-      2. Jetson, inductor fails at inference → ``cudagraphs`` (via fallback wrapper).
+      1. Jetson + Triton → ``inductor`` (RLocks replaced, dynamic=True, caches off).
+      2. Jetson, inductor still fails → ``cudagraphs`` (via ``_InductorWithCudagraphsFallback``).
       3. Non-Jetson, Triton available → ``inductor`` default (best kernel fusion).
       4. Non-Jetson, Triton unavailable → ``cudagraphs``.
       5. Eager fallback if all backends fail.
@@ -195,17 +294,25 @@ def _torch_compile(module: torch.nn.Module, *, mode: str = "default", fullgraph:
     _on_jetson = os.path.isfile("/etc/nv_tegra_release")
     if _on_jetson and _triton_available():
         # torch.compile() is lazy: the wrapper is created immediately but actual
-        # kernel compilation happens on the FIRST forward pass.  Two separate
-        # caches try to pickle module state at that point:
-        #   1. FxGraphCache  (torch._inductor.config.fx_graph_cache)       — inductor disk cache
-        #   2. AOTAutogradCache (torch._functorch.config.enable_autograd_cache) — added in PT 2.5+
-        # BEiT-3 / torchscale hold threading.RLock objects that appear as
-        # captured constants and are not picklable via torch's internal Pickler
-        # (which bypasses copyreg.dispatch_table).  Disabling BOTH caches
-        # eliminates all pickle serialisation during compilation.
+        # kernel compilation happens on the FIRST forward pass.  At that point,
+        # inductor serialises the FX graph's constants dict (which contains any
+        # _thread.RLock objects captured during dynamo tracing) to write kernel
+        # artefacts to a temp dir and send tasks to worker processes.
+        # The primary fix is _replace_rlocks_in_module (above): replace the C-
+        # extension RLock objects with Python wrappers that define __reduce__ so
+        # they are picklable by any Pickler.  Cache disabling below is belt-and-
+        # suspenders to reduce the total amount of pickling that happens.
         # dynamic=True compiles one symbolic graph for all vocabulary sizes,
         # avoiding per-shape recompilation overhead.
-        _make_locks_picklable()
+        # PRIMARY FIX: replace every _thread.RLock in the module with a
+        # _PicklableRLock wrapper before torch.compile() is called.  Inductor
+        # captures module attributes as FX-graph constants and pickles them when
+        # writing kernel artefacts; the native C RLock is not picklable by torch's
+        # internal Pickler (which bypasses copyreg.dispatch_table), but a Python
+        # wrapper with __reduce__ is always picklable.
+        _replace_rlocks_in_module(module)
+        _make_locks_picklable()  # belt-and-suspenders for other Pickler paths
+        # Disable all inductor / AOT-autograd disk caches to reduce pickling further.
         try:
             import torch._inductor.config as _ic
             _ic.fx_graph_cache = False
@@ -223,7 +330,7 @@ def _torch_compile(module: torch.nn.Module, *, mode: str = "default", fullgraph:
             pass
         try:
             compiled = torch.compile(module, mode=mode, fullgraph=fullgraph, dynamic=True)
-            print("[compile] Jetson+Triton: using torch.compile(inductor, dynamic=True, all caches disabled)", flush=True)
+            print("[compile] Jetson+Triton: using torch.compile(inductor, dynamic=True, RLocks replaced)", flush=True)
             # Wrap in a fallback shim: if the FIRST forward pass raises a pickle
             # error (compilation is lazy, error surfaces at inference time), we
             # transparently switch to the cudagraphs backend instead of crashing.
