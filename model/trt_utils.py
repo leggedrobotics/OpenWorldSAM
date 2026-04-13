@@ -146,24 +146,24 @@ def _torch_compile(module: torch.nn.Module, *, mode: str = "default", fullgraph:
             pass
         try:
             compiled = torch.compile(module, mode=mode, fullgraph=fullgraph, dynamic=True)
-            print("[compile] Jetson+Triton: using torch.compile(inductor, dynamic=True, no disk cache)")
+            print("[compile] Jetson+Triton: using torch.compile(inductor, dynamic=True, no disk cache)", flush=True)
             return compiled
         except Exception as e:
-            print(f"[compile] inductor failed ({e}); trying cudagraphs")
+            print(f"[compile] inductor failed ({e}); trying cudagraphs", flush=True)
     if _on_jetson:
         try:
             compiled = torch.compile(module, backend="cudagraphs", fullgraph=fullgraph)
-            print("[compile] Jetson: using torch.compile(cudagraphs)")
+            print("[compile] Jetson: using torch.compile(cudagraphs)", flush=True)
             return compiled
         except Exception as e:
-            print(f"[compile] cudagraphs failed ({e}); running in eager mode")
+            print(f"[compile] cudagraphs failed ({e}); running in eager mode", flush=True)
             return module
     if _triton_available():
         return torch.compile(module, mode=mode, fullgraph=fullgraph)
     # Non-Jetson but Triton unavailable — try cudagraphs before giving up.
     try:
         compiled = torch.compile(module, backend="cudagraphs", fullgraph=fullgraph)
-        print("[compile] Triton unavailable; using torch.compile(cudagraphs) fallback")
+        print("[compile] Triton unavailable; using torch.compile(cudagraphs) fallback", flush=True)
         return compiled
     except Exception as e:
         print(f"[compile] cudagraphs backend failed ({e}); running in eager mode")
@@ -772,5 +772,5 @@ def get_trt_decoder(
     # at runtime (e.g. from --lmm_per_image), which far outweighs the per-frame gain.
     # fullgraph=False avoids FakeTensor issues from SAM2's internal dict caches.
     compiled = _torch_compile(wrapper, mode="default", fullgraph=False)
-    print("[TRT] Decoder compiled")
+    print("[TRT] Decoder compiled", flush=True)
     return compiled
