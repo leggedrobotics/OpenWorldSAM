@@ -44,12 +44,25 @@ _TRT_CACHE_DIR = os.environ.get("OWSAM_TRT_CACHE", "/app/trt_cache")
 
 
 def _triton_available() -> bool:
-    """Return True if a working Triton installation exists (required for torch.compile inductor)."""
+    """Return True if Triton is installed AND can find the CUDA headers it needs to compile.
+
+    Triton imports successfully even when ``cuda.h`` is missing from its include search
+    path, but then fails at JIT-compile time with a CalledProcessError.  We check for
+    ``cuda.h`` upfront so that ``_torch_compile`` can fall back to ``cudagraphs`` before
+    any compilation attempt is made.
+    """
     try:
         import triton  # noqa: F401
-        return True
     except Exception:
         return False
+    # Verify the CUDA headers that Triton's nvidia backend needs are reachable by gcc.
+    cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda")
+    candidates = [
+        os.path.join(cuda_home, "include", "cuda.h"),
+        "/usr/local/cuda/include/cuda.h",
+        "/usr/include/cuda.h",
+    ]
+    return any(os.path.isfile(p) for p in candidates)
 
 
 def _torch_compile(module: torch.nn.Module, *, mode: str = "default", fullgraph: bool = False) -> torch.nn.Module:
