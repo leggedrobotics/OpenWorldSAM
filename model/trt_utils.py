@@ -108,46 +108,126 @@ def _make_locks_picklable() -> None:
             pass
 
 
+class _InductorWithCudagraphsFallback(torch.nn.Module):
+    """Wrap a torch.compile(inductor) module; fall back to cudagraphs on the first
+    forward pass if inductor raises a pickle error.
+
+    torch.compile() is lazy: the returned object is a thin wrapper that triggers
+    actual kernel compilation during the FIRST forward call.  If that compilation
+    fails (e.g. because threading.RLock objects inside BEiT-3 / torchscale are
+    not picklable by torch's internal Pickler), the error surfaces at inference
+    time — not at the torch.compile() call site, so a try/except around
+    torch.compile() cannot catch it.
+
+    This wrapper catches the TypeError on the first call, recompiles with the
+    cudagraphs backend (no pickling required), and continues transparently.
+    """
+
+    def __init__(self, compiled: torch.nn.Module, original: torch.nn.Module, fullgraph: bool):
+        super().__init__()
+        self._compiled = compiled
+        self._original = original
+        self._fullgraph = fullgraph
+        self._failed = False
+
+    def forward(self, *args, **kwargs):
+        if not self._failed:
+            try:
+                return self._compiled(*args, **kwargs)
+            except TypeError as exc:
+                if "pickle" in str(exc).lower() or "RLock" in str(exc):
+                    print(
+                        f"[compile] inductor pickle error on first inference ({exc}); "
+                        "falling back to cudagraphs",
+                        flush=True,
+                    )
+                    self._failed = True
+                    torch._dynamo.reset()
+                    try:
+                        self._compiled = torch.compile(
+                            self._original, backend="cudagraphs", fullgraph=self._fullgraph
+                        )
+                        print("[compile] fallback to torch.compile(cudagraphs) succeeded", flush=True)
+                    except Exception as e2:
+                        print(f"[compile] cudagraphs fallback also failed ({e2}); running eager", flush=True)
+                        self._compiled = self._original
+                else:
+                    raise
+        return self._compiled(*args, **kwargs)
+
+    # Proxy attribute access to the wrapped compiled module so that
+    # downstream code that reads e.g. module.conv_s0 still works.
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self._compiled, name)
+
+
 def _torch_compile(module: torch.nn.Module, *, mode: str = "default", fullgraph: bool = False) -> torch.nn.Module:
     """Compile ``module`` with the best available backend.
 
     On Jetson (detected via ``/etc/nv_tegra_release``), ``threading.RLock``
-    objects inside BEiT-3 / torchscale are not picklable by default, causing
-    ``TypeError: cannot pickle '_thread.RLock' object`` when inductor builds
-    compilation guards.  ``_make_locks_picklable()`` registers copyreg handlers
-    so dynamo can serialise them safely.  ``dynamic=True`` additionally compiles
-    one symbolic-shape graph for all vocabulary sizes, avoiding per-shape
-    recompilation overhead.  Falls back to ``cudagraphs`` if inductor still fails.
+    objects inside BEiT-3 / torchscale are captured as constants by dynamo and
+    are not picklable by torch's internal Pickler (which bypasses
+    ``copyreg.dispatch_table``).  Two inductor caches try to pickle compiled
+    graph artifacts during the FIRST forward pass (not at ``torch.compile()``
+    call time, because compilation is lazy):
+
+      * ``FxGraphCache``     — inductor disk cache (``fx_graph_cache``).
+      * ``AOTAutogradCache`` — higher-level AOT autograd cache, enabled by
+                               default since PyTorch 2.5
+                               (``torch._functorch.config.enable_autograd_cache``).
+
+    Both are disabled before calling ``torch.compile()``.  In addition, the
+    returned wrapper is an ``_InductorWithCudagraphsFallback`` that intercepts
+    any ``TypeError: cannot pickle`` raised during the first forward pass and
+    transparently re-compiles with the ``cudagraphs`` backend, so the model
+    continues to run even if a cache path we haven't disabled still pickles.
 
     Priority:
-      1. Jetson + Triton → ``inductor`` with ``dynamic=True`` + picklable locks.
-      2. Jetson, inductor fails → ``cudagraphs`` (no pickling required).
+      1. Jetson + Triton → ``inductor`` (dynamic=True, all caches disabled).
+      2. Jetson, inductor fails at inference → ``cudagraphs`` (via fallback wrapper).
       3. Non-Jetson, Triton available → ``inductor`` default (best kernel fusion).
       4. Non-Jetson, Triton unavailable → ``cudagraphs``.
       5. Eager fallback if all backends fail.
     """
     _on_jetson = os.path.isfile("/etc/nv_tegra_release")
     if _on_jetson and _triton_available():
-        # The inductor disk cache (FxGraphCache) serialises compiled graph
-        # artifacts via pickle.  BEiT-3 / torchscale hold threading.RLock
-        # objects that appear as captured constants in the computation graph;
-        # torch's internal Pickler subclass bypasses copyreg.dispatch_table,
-        # so the copyreg workaround has no effect.  Disabling the disk cache
-        # prevents any pickle serialisation of the graph artifacts entirely.
-        # The in-memory cache (per-process) is unaffected, so re-entrant
-        # calls with the same shapes are still served from memory.
+        # torch.compile() is lazy: the wrapper is created immediately but actual
+        # kernel compilation happens on the FIRST forward pass.  Two separate
+        # caches try to pickle module state at that point:
+        #   1. FxGraphCache  (torch._inductor.config.fx_graph_cache)       — inductor disk cache
+        #   2. AOTAutogradCache (torch._functorch.config.enable_autograd_cache) — added in PT 2.5+
+        # BEiT-3 / torchscale hold threading.RLock objects that appear as
+        # captured constants and are not picklable via torch's internal Pickler
+        # (which bypasses copyreg.dispatch_table).  Disabling BOTH caches
+        # eliminates all pickle serialisation during compilation.
         # dynamic=True compiles one symbolic graph for all vocabulary sizes,
         # avoiding per-shape recompilation overhead.
         _make_locks_picklable()
         try:
             import torch._inductor.config as _ic
             _ic.fx_graph_cache = False
+            if hasattr(_ic, "force_disable_caches"):
+                _ic.force_disable_caches = True
+            if hasattr(_ic, "autotune_local_cache"):
+                _ic.autotune_local_cache = False
+        except Exception:
+            pass
+        try:
+            import torch._functorch.config as _fc
+            if hasattr(_fc, "enable_autograd_cache"):
+                _fc.enable_autograd_cache = False
         except Exception:
             pass
         try:
             compiled = torch.compile(module, mode=mode, fullgraph=fullgraph, dynamic=True)
-            print("[compile] Jetson+Triton: using torch.compile(inductor, dynamic=True, no disk cache)", flush=True)
-            return compiled
+            print("[compile] Jetson+Triton: using torch.compile(inductor, dynamic=True, all caches disabled)", flush=True)
+            # Wrap in a fallback shim: if the FIRST forward pass raises a pickle
+            # error (compilation is lazy, error surfaces at inference time), we
+            # transparently switch to the cudagraphs backend instead of crashing.
+            return _InductorWithCudagraphsFallback(compiled, module, fullgraph)
         except Exception as e:
             print(f"[compile] inductor failed ({e}); trying cudagraphs", flush=True)
     if _on_jetson:
