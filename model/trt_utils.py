@@ -43,6 +43,36 @@ import torch.nn.functional as F
 _TRT_CACHE_DIR = os.environ.get("OWSAM_TRT_CACHE", "/app/trt_cache")
 
 
+def _triton_available() -> bool:
+    """Return True if a working Triton installation exists (required for torch.compile inductor)."""
+    try:
+        import triton  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _torch_compile(module: torch.nn.Module, *, mode: str = "default", fullgraph: bool = False) -> torch.nn.Module:
+    """Compile ``module`` with the best available backend.
+
+    Priority:
+      1. ``inductor`` (default torch.compile backend) — best kernel fusion; requires Triton.
+      2. ``cudagraphs``  — captures CUDA kernel launches as a CUDA graph for replay;
+         reduces Python/driver scheduling overhead without needing Triton.
+      3. Eager fallback  — returned unmodified if both backends fail.
+    """
+    if _triton_available():
+        return torch.compile(module, mode=mode, fullgraph=fullgraph)
+    # Triton unavailable (e.g. Jetson ARM) — try cudagraphs which needs no Triton.
+    try:
+        compiled = torch.compile(module, backend="cudagraphs", fullgraph=fullgraph)
+        print("[compile] Triton unavailable; using torch.compile(cudagraphs) fallback")
+        return compiled
+    except Exception as e:
+        print(f"[compile] cudagraphs backend failed ({e}); running in eager mode")
+        return module
+
+
 # ---------------------------------------------------------------------------
 # Patched forward implementations
 # ---------------------------------------------------------------------------
@@ -467,7 +497,7 @@ def get_trt_encoder(image_encoder: torch.nn.Module, dtype: torch.dtype, device: 
         import torch_tensorrt
     except ImportError:
         print("[TRT] torch-tensorrt not installed, falling back to torch.compile")
-        return torch.compile(image_encoder, mode="default", fullgraph=False)
+        return _torch_compile(image_encoder, mode="default", fullgraph=False)
 
     os.makedirs(_TRT_CACHE_DIR, exist_ok=True)
     dtype_tag = {torch.float32: "fp32", torch.float16: "fp16", torch.bfloat16: "bf16"}.get(dtype, "fp32")
@@ -531,7 +561,7 @@ def get_trt_encoder(image_encoder: torch.nn.Module, dtype: torch.dtype, device: 
         print(f"[TRT] TRT compilation failed: {e}")
         traceback.print_exc()
         print("[TRT] Falling back to torch.compile")
-        return torch.compile(image_encoder, mode="default", fullgraph=False)
+        return _torch_compile(image_encoder, mode="default", fullgraph=False)
 
 
 class _TRTDecoderAdapter(nn.Module):
@@ -644,6 +674,7 @@ def get_trt_decoder(
     # causes ~200 ms Triton kernel-search spikes for every new vocab size encountered
     # at runtime (e.g. from --lmm_per_image), which far outweighs the per-frame gain.
     # fullgraph=False avoids FakeTensor issues from SAM2's internal dict caches.
-    compiled = torch.compile(wrapper, mode="default", fullgraph=False)
-    print("[TRT] Decoder compiled with torch.compile(default)")
+    # Falls back to cudagraphs backend when Triton is unavailable (e.g. Jetson ARM).
+    compiled = _torch_compile(wrapper, mode="default", fullgraph=False)
+    print("[TRT] Decoder optimised (torch.compile)")
     return compiled
