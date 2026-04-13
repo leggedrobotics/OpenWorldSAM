@@ -703,7 +703,14 @@ def get_trt_decoder(
     # causes ~200 ms Triton kernel-search spikes for every new vocab size encountered
     # at runtime (e.g. from --lmm_per_image), which far outweighs the per-frame gain.
     # fullgraph=False avoids FakeTensor issues from SAM2's internal dict caches.
-    # Falls back to cudagraphs backend when Triton is unavailable (e.g. Jetson ARM).
-    compiled = _torch_compile(wrapper, mode="default", fullgraph=False)
-    print("[TRT] Decoder optimised (torch.compile)")
+    # On Jetson the patched methods (types.MethodType) bound onto the decoder are not
+    # picklable, so the inductor backend fails with "cannot pickle '_thread.RLock'".
+    # Use cudagraphs (no model-state serialisation) on Jetson only.
+    _on_jetson = os.path.isfile("/etc/nv_tegra_release")
+    if _on_jetson:
+        compiled = torch.compile(wrapper, backend="cudagraphs", fullgraph=False)
+        print("[TRT] Decoder compiled with torch.compile(cudagraphs, Jetson)")
+    else:
+        compiled = _torch_compile(wrapper, mode="default", fullgraph=False)
+        print("[TRT] Decoder compiled with torch.compile(default)")
     return compiled
