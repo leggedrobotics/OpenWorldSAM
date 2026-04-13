@@ -55,14 +55,23 @@ def _triton_available() -> bool:
         import triton  # noqa: F401
     except Exception:
         return False
-    # Verify the CUDA headers that Triton's nvidia backend needs are reachable by gcc.
+    # Verify the CUDA tools that Triton needs to compile kernels are accessible.
+    import shutil
     cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda")
-    candidates = [
+    # 1. cuda.h — needed by Triton's cuda_utils.c gcc compilation step.
+    cuda_h_candidates = [
         os.path.join(cuda_home, "include", "cuda.h"),
         "/usr/local/cuda/include/cuda.h",
         "/usr/include/cuda.h",
     ]
-    return any(os.path.isfile(p) for p in candidates)
+    if not any(os.path.isfile(p) for p in cuda_h_candidates):
+        return False
+    # 2. ptxas — PTX assembler called by Triton to produce GPU binaries.
+    if shutil.which("ptxas") is None:
+        ptxas_path = os.path.join(cuda_home, "bin", "ptxas")
+        if not os.path.isfile(ptxas_path):
+            return False
+    return True
 
 
 def _torch_compile(module: torch.nn.Module, *, mode: str = "default", fullgraph: bool = False) -> torch.nn.Module:
