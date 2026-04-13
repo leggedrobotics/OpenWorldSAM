@@ -128,14 +128,25 @@ def _torch_compile(module: torch.nn.Module, *, mode: str = "default", fullgraph:
     """
     _on_jetson = os.path.isfile("/etc/nv_tegra_release")
     if _on_jetson and _triton_available():
-        # Register copyreg handlers so threading.RLock / threading.Lock instances
-        # inside BEiT-3 can be pickled by inductor's guard-serialisation step.
-        # dynamic=True compiles one symbolic-shape graph for all vocab sizes,
+        # The inductor disk cache (FxGraphCache) serialises compiled graph
+        # artifacts via pickle.  BEiT-3 / torchscale hold threading.RLock
+        # objects that appear as captured constants in the computation graph;
+        # torch's internal Pickler subclass bypasses copyreg.dispatch_table,
+        # so the copyreg workaround has no effect.  Disabling the disk cache
+        # prevents any pickle serialisation of the graph artifacts entirely.
+        # The in-memory cache (per-process) is unaffected, so re-entrant
+        # calls with the same shapes are still served from memory.
+        # dynamic=True compiles one symbolic graph for all vocabulary sizes,
         # avoiding per-shape recompilation overhead.
         _make_locks_picklable()
         try:
+            import torch._inductor.config as _ic
+            _ic.fx_graph_cache = False
+        except Exception:
+            pass
+        try:
             compiled = torch.compile(module, mode=mode, fullgraph=fullgraph, dynamic=True)
-            print("[compile] Jetson+Triton: using torch.compile(inductor, dynamic=True)")
+            print("[compile] Jetson+Triton: using torch.compile(inductor, dynamic=True, no disk cache)")
             return compiled
         except Exception as e:
             print(f"[compile] inductor failed ({e}); trying cudagraphs")
