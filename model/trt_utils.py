@@ -97,6 +97,20 @@ def _torch_compile(module: torch.nn.Module, *, mode: str = "default", fullgraph:
       4. Eager fallback if all backends fail.
     """
     _on_jetson = os.path.isfile("/etc/nv_tegra_release")
+    if _on_jetson and _triton_available():
+        # On Jetson, types.MethodType patches and threading.RLock objects inside
+        # BEiT-3 / SAM2 are not picklable by inductor's guard-serialisation step.
+        # Disabling nn.Module guards avoids the pickle entirely — safe for fixed
+        # inference weights since dynamo only loses the ability to detect weight
+        # swaps at runtime (which never happens here).
+        try:
+            import torch._dynamo as _dynamo
+            _dynamo.config.guard_nn_modules = False
+            compiled = torch.compile(module, mode=mode, fullgraph=fullgraph)
+            print("[compile] Jetson+Triton: using torch.compile(inductor, guard_nn_modules=False)")
+            return compiled
+        except Exception as e:
+            print(f"[compile] inductor with guard_nn_modules=False failed ({e}); trying cudagraphs")
     if _on_jetson:
         try:
             compiled = torch.compile(module, backend="cudagraphs", fullgraph=fullgraph)
