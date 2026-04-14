@@ -722,22 +722,15 @@ def _proj_2d(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
     Supports arbitrary batch prefixes (e.g. ``[N, S, C]`` or ``[N, C]``).
     """
     shape = x.shape          # (..., S, C)
-    # Image-feature keys from TwoWayTransformer arrive with non-contiguous strides
-    # from flatten(2).permute(0,2,1).  Two strategies fail for TRT:
-    #   • x.view(-1, C)     → ValueError at export time (view requires contiguous).
-    #   • x.reshape(-1, C)  → aten._reshape_copy (fused copy+reshape SHUFFLE); TRT
-    #                          fuses this with the weight's permute SHUFFLE (weight.T)
-    #                          into a ForeignNode that has no valid kernel.
-    # Correct fix: x.contiguous().view(-1, C)
-    #   • contiguous() → aten.clone  — a data-copy op in TRT, NOT a SHUFFLE layer.
-    #   • view()        → aten.view  — a pure descriptor SHUFFLE (no data movement).
-    # TRT keeps clone and SHUFFLE separate: the view SHUFFLE folds into the matmul's
-    # input descriptor, leaving a standard IMatrixMultiplyLayer(input, weight, TRANSPOSE)
-    # that TRT compiles correctly.  For already-contiguous inputs (q, v, queries),
-    # contiguous() is a no-op at trace time so no clone is emitted.
-    x_2d  = x.contiguous().view(-1, shape[-1])   # [N*S, C]
-    out   = module(x_2d)                          # [N*S, C']
-    return out.view(*shape[:-1], out.shape[-1])   # [..., S, C'] (out is always contiguous)
+    # All callers pass contiguous tensors (image keys guaranteed by the
+    # TwoWayTransformer patch; q/v/queries/out_proj input are always contiguous).
+    # Use plain view so the exported graph contains aten.view (a pure descriptor
+    # SHUFFLE with no data movement) rather than aten._reshape_copy (a copy+reshape
+    # SHUFFLE that TRT fuses with the weight's permute SHUFFLE into a ForeignNode
+    # with no valid kernel).
+    x_2d  = x.view(-1, shape[-1])   # [N*S, C]
+    out   = module(x_2d)             # [N*S, C']
+    return out.view(*shape[:-1], out.shape[-1])  # [..., S, C']
 
 
 def _attention_forward_patched(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -866,6 +859,67 @@ def _patch_two_way_attn_blocks(module: nn.Module) -> int:
     for mod in module.modules():
         if isinstance(mod, TwoWayAttentionBlock):
             mod.forward = types.MethodType(_two_way_attn_block_forward_patched, mod)
+            patched += 1
+    return patched
+
+
+def _two_way_transformer_forward_patched(
+    self,
+    image_embedding: torch.Tensor,
+    image_pe: torch.Tensor,
+    point_embedding: torch.Tensor,
+):
+    """TwoWayTransformer.forward with contiguous image keys.
+
+    The original ``flatten(2).permute(0, 2, 1)`` leaves ``image_embedding`` with
+    strides ``(0, 1, 4096)`` — non-contiguous.  When this tensor propagates into
+    ``_proj_2d`` the exported aten graph contains ``aten._reshape_copy`` which TRT
+    fuses with the weight's permute SHUFFLE into a ForeignNode that has no valid
+    kernel::
+
+        ForeignNode[k_proj/..[SHUFFLE(permute)] + [SHUFFLE(_reshape_copy)]]
+
+    Adding ``.contiguous()`` after each ``permute`` makes the keys and image PE
+    ``[N, 4096, 256]``-contiguous, so ``_proj_2d`` can use plain ``aten.view`` (a
+    pure descriptor SHUFFLE with no data movement).  TRT then sees the standard
+    ``view → IMatrixMultiplyLayer(weight, TRANSPOSE)`` pattern it can compile.
+    """
+    bs, c, h, w = image_embedding.shape
+    image_embedding = image_embedding.flatten(2).permute(0, 2, 1).contiguous()
+    image_pe        = image_pe.flatten(2).permute(0, 2, 1).contiguous()
+
+    queries = point_embedding
+    keys    = image_embedding
+
+    for layer in self.layers:
+        queries, keys = layer(
+            queries=queries,
+            keys=keys,
+            query_pe=point_embedding,
+            key_pe=image_pe,
+        )
+
+    q = queries + point_embedding
+    k = keys + image_pe
+    attn_out = self.final_attn_token_to_image(q=q, k=k, v=keys)
+    queries  = queries + attn_out
+    queries  = self.norm_final_attn(queries)
+    return queries, keys
+
+
+def _patch_two_way_transformer(module: nn.Module) -> int:
+    """Patch TwoWayTransformer.forward to produce contiguous image-key tensors."""
+    try:
+        from model.segment_anything_2.sam2.modeling.sam.transformer import TwoWayTransformer
+    except ImportError:
+        try:
+            from sam2.modeling.sam.transformer import TwoWayTransformer
+        except ImportError:
+            return 0
+    patched = 0
+    for mod in module.modules():
+        if isinstance(mod, TwoWayTransformer):
+            mod.forward = types.MethodType(_two_way_transformer_forward_patched, mod)
             patched += 1
     return patched
 
@@ -1211,13 +1265,15 @@ def get_trt_decoder(
     wrapper = wrapper.to(device=device, dtype=dtype).eval()
 
     # Apply source-compatible patches (improve both correctness and fusion quality)
-    n_attn   = _patch_attention(wrapper)
-    n_twoway = _patch_two_way_attn_blocks(wrapper)
-    n_dec    = _patch_mask_decoder(wrapper)
-    n_ln     = _patch_layer_norm_2d(wrapper)
+    n_attn        = _patch_attention(wrapper)
+    n_twoway      = _patch_two_way_attn_blocks(wrapper)
+    n_dec         = _patch_mask_decoder(wrapper)
+    n_ln          = _patch_layer_norm_2d(wrapper)
+    n_transformer = _patch_two_way_transformer(wrapper)
     print(
         f"[TRT] Decoder patches applied: Attention×{n_attn}, "
-        f"TwoWayBlock×{n_twoway}, MaskDecoder×{n_dec}, LayerNorm2d×{n_ln}"
+        f"TwoWayBlock×{n_twoway}, MaskDecoder×{n_dec}, "
+        f"LayerNorm2d×{n_ln}, TwoWayTransformer×{n_transformer}"
     )
 
     # On Jetson, attempt TRT compilation first.
