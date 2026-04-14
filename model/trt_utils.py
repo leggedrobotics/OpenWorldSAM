@@ -1103,41 +1103,42 @@ def get_trt_decoder(
     device: str = "cuda:0",
     max_n_prompts: int = 400,
 ) -> nn.Module:
-    """Return a torch.compile-optimised SAM2 mask decoder wrapper.
+    """Return a TRT-compiled (Jetson) or torch.compile-optimised SAM2 mask decoder.
 
-    TensorRT compilation of this decoder was investigated but cannot succeed in
-    TRT 2.5 because SAM2's TwoWayTransformer cross-attention has a dynamic batch
-    dimension (vocab_size × num_tokens) on the query side while the image-feature
-    key/value tensors start at batch=1.  TRT fuses the implicit ``expand`` broadcast
-    inside SDPA with surrounding SHUFFLE layers into a ``ForeignNode`` for which no
-    valid kernel exists.  The official torch-tensorrt SAM2 tutorial (pytorch/TensorRT
-    examples/dynamo/torch_export_sam2.py) also compiles only the image encoder.
+    Desktop (TRT 2.5): TRT compilation fails because SAM2's TwoWayTransformer
+    cross-attention has a dynamic batch dim (vocab_size × num_tokens) on the query
+    side while image features start at batch=1.  TRT fuses the implicit ``expand``
+    broadcast inside SDPA with SHUFFLE layers into a ``ForeignNode`` with no valid
+    kernel.  ``torch.compile(mode="default")`` is used instead (~23 ms vs ~52 ms
+    baseline on RTX 6000).
 
-    ``torch.compile(mode="default")`` achieves good per-image latency (~23 ms vs
-    ~52 ms baseline) while keeping recompilation for unseen vocabulary sizes cheap
-    (~5–10 ms).  ``max-autotune`` was tried but causes ~200 ms Triton autotuning
-    spikes whenever ``--lmm_per_image`` generates a vocabulary size not covered by
-    the startup warmup.
+    Jetson (TRT 10.x): The patches applied below (explicit ``expand`` in
+    ``TwoWayAttentionBlock``, ``unflatten/flatten`` in ``predict_masks``) expose the
+    broadcast and reshape ops in TRT-native form.  TRT 10.x may succeed where 2.5
+    could not.  We attempt TRT compilation first and fall back to ``torch.compile``
+    if it fails.  The engine is cached to ``_TRT_CACHE_DIR`` so subsequent starts
+    are instant.
 
-    Patches applied to the wrapper (also benefit torch.compile correctness):
-    - ``Attention.forward`` — removes the non-traceable ``sdp_kernel`` context manager;
-      inlines head separation using last-dim ops.
-    - ``TwoWayAttentionBlock.forward`` — explicit ``expand`` before cross-attention so
-      the compiler sees clean broadcast ops, not hidden data-dependent ones.
-    - ``MaskDecoder.predict_masks`` — replaces ``repeat_interleave`` (dynamic-batch
-      reshape) with ``expand``; replaces ``view(b,...)`` with ``unflatten/flatten``.
-    - ``LayerNorm2d.forward`` — uses ``F.layer_norm`` to remove weight ``[:, None, None]``
-      unsqueeze patterns that interfere with kernel fusion.
+    Patches applied (benefit both TRT tracing and torch.compile fusion):
+    - ``Attention.forward`` — removes non-traceable ``sdp_kernel`` context manager;
+      inlines head-separation using last-dim ops only.
+    - ``TwoWayAttentionBlock.forward`` — explicit ``keys.expand(N, ...)`` before
+      cross-attention so TRT sees a plain broadcast, not a hidden data-dependent one.
+    - ``MaskDecoder.predict_masks`` — replaces ``repeat_interleave`` with ``expand``;
+      replaces ``view(b, ...)`` with ``unflatten/flatten`` (no dynamic-b capture).
+    - ``LayerNorm2d.forward`` — ``F.layer_norm`` removes unsqueeze patterns that
+      interfere with kernel fusion.
 
     Args:
         decoder: The SAM2 ``MaskDecoder`` module.
         no_mask_embed_weight: ``sam_prompt_encoder.no_mask_embed.weight`` tensor.
         dtype: Compute dtype (e.g. ``torch.bfloat16``).
         device: CUDA device string.
-        max_n_prompts: Unused; kept for API compatibility.
+        max_n_prompts: Upper bound on N = vocab_size × num_tokens used for the TRT
+            dynamic-shape profile (default 400 = 20 classes × 20 tokens).
 
     Returns:
-        ``torch.compile``-d ``_DecoderWrapper`` ready for inference.
+        TRT-compiled or ``torch.compile``-d ``_DecoderWrapper`` ready for inference.
     """
     wrapper = _DecoderWrapper(decoder, no_mask_embed_weight)
     wrapper = wrapper.to(device=device, dtype=dtype).eval()
@@ -1152,11 +1153,147 @@ def get_trt_decoder(
         f"TwoWayBlock×{n_twoway}, MaskDecoder×{n_dec}, LayerNorm2d×{n_ln}"
     )
 
-    # torch.compile — "default" mode keeps recompilation for unseen vocabulary sizes
-    # cheap (~5–10 ms) at the cost of ~6 ms/frame vs max-autotune.  max-autotune
-    # causes ~200 ms Triton kernel-search spikes for every new vocab size encountered
-    # at runtime (e.g. from --lmm_per_image), which far outweighs the per-frame gain.
+    # On Jetson, attempt TRT compilation first.
+    _on_jetson = os.path.isfile("/etc/nv_tegra_release")
+    if _on_jetson:
+        _trt = _try_trt_decoder(wrapper, dtype, device, max_n_prompts)
+        if _trt is not None:
+            print("[TRT] Decoder compiled (TensorRT)", flush=True)
+            return _trt
+        print("[TRT] TRT decoder failed; falling back to torch.compile", flush=True)
+
+    # Fallback: torch.compile with inductor/cudagraphs backend.
+    # "default" mode keeps recompilation for new vocab sizes cheap (~5–10 ms).
     # fullgraph=False avoids FakeTensor issues from SAM2's internal dict caches.
     compiled = _torch_compile(wrapper, mode="default", fullgraph=False)
-    print("[TRT] Decoder compiled", flush=True)
+    print("[TRT] Decoder compiled (torch.compile)", flush=True)
     return compiled
+
+
+def _try_trt_decoder(
+    wrapper: nn.Module,
+    dtype: torch.dtype,
+    device: str,
+    max_n_prompts: int,
+) -> "nn.Module | None":
+    """Attempt TRT compilation of the patched ``_DecoderWrapper``.
+
+    Returns the compiled module on success, or ``None`` if TRT compilation fails
+    (triggering the torch.compile fallback in ``get_trt_decoder``).
+
+    Shape assumptions (verified against open_world_sam2.py):
+      - image_embeddings:  [1, 256, 64, 64]   — static (SAM2 backbone output)
+      - image_pe:          [1, 256, 64, 64]   — static (dense positional encoding)
+      - sparse_embeddings: [N, 1, 256]        — N dynamic; T=1 (prompt encoder
+                                                outputs one 256-d embedding per slot)
+      - high_res_s0:       [1, 32, 256, 256]  — static (FPN level 0)
+      - high_res_s1:       [1, 64, 128, 128]  — static (FPN level 1)
+
+    N = vocab_size × num_tokens.  Shape profile:
+      min = num_tokens    (single class)
+      opt = 5 × num_tokens (typical 5-class scene)
+      max = max_n_prompts  (generous upper bound, default 400)
+    """
+    try:
+        import torch_tensorrt
+    except ImportError:
+        return None
+
+    try:
+        _num_tokens = int(os.environ.get("OWSAM_NUM_TOKENS", "20"))
+    except ValueError:
+        _num_tokens = 20
+
+    os.makedirs(_TRT_CACHE_DIR, exist_ok=True)
+    dtype_tag = {torch.float32: "fp32", torch.float16: "fp16", torch.bfloat16: "bf16"}.get(dtype, "fp32")
+    sm = torch.cuda.get_device_capability(torch.device(device))
+    # Include num_tokens in the cache key: it determines the min/opt shape profile.
+    trt_path = os.path.join(
+        _TRT_CACHE_DIR,
+        f"sam2_decoder_sm{sm[0]}{sm[1]}_{dtype_tag}_tok{_num_tokens}.ep",
+    )
+
+    if os.path.exists(trt_path):
+        print(f"[TRT] Loading cached TRT decoder from {trt_path}")
+        try:
+            loaded = torch.export.load(trt_path)
+            print("[TRT] TRT decoder loaded from cache")
+            return loaded.module()
+        except Exception as e:
+            print(f"[TRT] Failed to load cached decoder ({e}); recompiling...")
+
+    print("[TRT] Compiling SAM2 decoder with TensorRT (first run ~2-5 min)...")
+
+    # T=1: the SAM2 prompt encoder outputs one 256-d embedding per prompt slot.
+    T = 1
+    _N_min = _num_tokens            # 1 class
+    _N_opt = min(5 * _num_tokens, max_n_prompts)   # 5 classes (typical)
+    _N_max = max_n_prompts          # generous upper bound
+
+    # Jetson unified-memory: 512 MB workspace avoids discrete-GPU layout choices.
+    _workspace = 512 * 1024 ** 2
+
+    _dev = torch.device(device)
+    eg_image_emb   = torch.zeros(1,       256,  64,  64, dtype=dtype, device=_dev)
+    eg_image_pe    = torch.zeros(1,       256,  64,  64, dtype=dtype, device=_dev)
+    eg_sparse_emb  = torch.zeros(_N_opt,  T,   256,      dtype=dtype, device=_dev)
+    eg_high_res_s0 = torch.zeros(1,       32,  256, 256, dtype=dtype, device=_dev)
+    eg_high_res_s1 = torch.zeros(1,       64,  128, 128, dtype=dtype, device=_dev)
+
+    try:
+        from torch.export import Dim
+
+        # N is the only dynamic dimension: vocab_size × num_tokens.
+        # T=1, all spatial dims and channel dims are static.
+        _N_dim = Dim("N", min=_N_min, max=_N_max)
+
+        with torch.no_grad():
+            exported = torch.export.export(
+                wrapper,
+                args=(eg_image_emb, eg_image_pe, eg_sparse_emb,
+                      eg_high_res_s0, eg_high_res_s1),
+                dynamic_shapes={
+                    "image_embeddings": {},            # [1, 256, 64, 64] — static
+                    "image_pe":         {},            # [1, 256, 64, 64] — static
+                    "sparse_embeddings": {0: _N_dim},  # [N, 1, 256] — N dynamic
+                    "high_res_s0":      {},            # [1, 32, 256, 256] — static
+                    "high_res_s1":      {},            # [1, 64, 128, 128] — static
+                },
+                strict=False,
+            )
+
+        trt_decoder = torch_tensorrt.dynamo.compile(
+            exported,
+            inputs=[
+                torch_tensorrt.Input(shape=[1, 256, 64, 64], dtype=dtype),
+                torch_tensorrt.Input(shape=[1, 256, 64, 64], dtype=dtype),
+                torch_tensorrt.Input(
+                    min_shape=[_N_min, T, 256],
+                    opt_shape=[_N_opt, T, 256],
+                    max_shape=[_N_max, T, 256],
+                    dtype=dtype,
+                ),
+                torch_tensorrt.Input(shape=[1, 32, 256, 256], dtype=dtype),
+                torch_tensorrt.Input(shape=[1, 64, 128, 128], dtype=dtype),
+            ],
+            enabled_precisions={dtype},
+            truncate_double=True,
+            device=_dev,
+            workspace_size=_workspace,
+            optimization_level=3,
+            use_fp32_acc=True,
+        )
+
+        torch_tensorrt.save(
+            trt_decoder, trt_path,
+            inputs=[eg_image_emb, eg_image_pe, eg_sparse_emb,
+                    eg_high_res_s0, eg_high_res_s1],
+        )
+        print(f"[TRT] TRT decoder engine saved to {trt_path}")
+        return trt_decoder
+
+    except Exception as e:
+        import traceback
+        print(f"[TRT] Decoder TRT compilation failed: {e}")
+        traceback.print_exc()
+        return None
