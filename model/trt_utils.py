@@ -78,55 +78,107 @@ def _triton_available() -> bool:
     if not os.path.isfile(ptxas_path):
         return False
     os.environ.setdefault("TRITON_PTXAS_PATH", ptxas_path)
-    _patch_kernel_metadata_cluster_dims()
+    _patch_triton_compiled_kernel_cta_attrs()
     return True
 
 
-def _patch_kernel_metadata_cluster_dims() -> None:
-    """Add ``cluster_dims = (1, 1, 1)`` to ``KernelMetadata`` if missing.
+def _patch_triton_compiled_kernel_cta_attrs() -> None:
+    """Add __getattr__ to Triton's CompiledKernel so num_ctas/cluster_dims are
+    accessible directly on the binary object.
 
-    PyTorch 2.8 inductor accesses ``metadata.cluster_dims`` unconditionally
-    when processing compiled Triton kernels.  Thread-block clustering is a
-    Hopper (SM90 / H100) feature; Triton 3.x on aarch64 (Jetson Orin, SM87
-    Ampere) omits ``cluster_dims`` from ``KernelMetadata`` because it is
-    never used.  Setting it as a class attribute with the no-cluster default
-    ``(1, 1, 1)`` allows the inductor code path to proceed correctly.
+    Root cause: torch/_inductor/runtime/triton_heuristics.py chooses between two
+    code paths based on hasattr(binary, "num_ctas"):
 
-    The patch is applied to both Triton's own ``KernelMetadata`` and to any
-    ``KernelMetadata`` class inside PyTorch's inductor (the exact module path
-    changed between PyTorch 2.6 and 2.8).
+      # Branch 1 — safe, has a fallback chain:
+      (binary.num_ctas, *get_first_attr(binary, "cluster_dims", "clusterDims"))
+      if hasattr(binary, "num_ctas")
+
+      # Branch 2 — crashes on Jetson, no fallback:
+      else: (binary.metadata.num_ctas, *binary.metadata.cluster_dims)
+
+    On Jetson, binary.num_ctas does not exist as a direct attribute, forcing
+    branch 2.  Triton 3.x on aarch64 (SM87) omits cluster_dims from
+    KernelMetadata because thread-block clustering is H100/SM90-only, so
+    binary.metadata.cluster_dims raises AttributeError.
+
+    Fix: add __getattr__ to CompiledKernel so that binary.num_ctas,
+    binary.cluster_dims and binary.clusterDims are answered via metadata
+    (with safe defaults).  hasattr(binary, "num_ctas") then returns True and
+    inductor always takes branch 1, never reaching binary.metadata.cluster_dims.
+
+    Patching the KernelMetadata *class* (class attribute or __getattr__ on the
+    class) does not work reliably because the binary.metadata instance can come
+    from a backend-specific class (e.g. triton.backends.nvidia.compiler) that is
+    different from the module-level KernelMetadata we find at import time.
     """
-    _patched_locations: list[str] = []
+    import sys
+    import importlib as _il
 
-    # 1. Triton's KernelMetadata
-    try:
-        from triton.compiler.compiler import KernelMetadata as _KM
-        if not hasattr(_KM, "cluster_dims"):
-            _KM.cluster_dims = (1, 1, 1)
-            _patched_locations.append("triton.compiler.compiler.KernelMetadata")
-    except Exception:
-        pass
-
-    # 2. PyTorch inductor's KernelMetadata (location varies by version)
-    for _mod_path in (
-        "torch._inductor.triton_heuristics",
-        "torch._inductor.runtime.triton_heuristics",
+    # Force-import known Triton module paths so their classes are in sys.modules
+    # before the scan.  This is needed if _triton_available() runs before any
+    # Triton kernel has been compiled (which is the typical case at model init).
+    for _force_path in (
+        "triton.compiler.compiler",
+        "triton.runtime.jit",
+        "triton.backends.nvidia.compiler",
     ):
         try:
-            import importlib as _il
-            _mod = _il.import_module(_mod_path)
-            _KM = getattr(_mod, "KernelMetadata", None)
-            if _KM is not None and not hasattr(_KM, "cluster_dims"):
-                _KM.cluster_dims = (1, 1, 1)
-                _patched_locations.append(f"{_mod_path}.KernelMetadata")
+            _il.import_module(_force_path)
         except Exception:
             pass
 
-    if _patched_locations:
+    _found = False
+    for _mod_name in list(sys.modules):
+        if "triton" not in _mod_name:
+            continue
+        _mod = sys.modules.get(_mod_name)
+        if _mod is None:
+            continue
+        _CK = getattr(_mod, "CompiledKernel", None)
+        if _CK is None or not isinstance(_CK, type):
+            continue
+        if getattr(_CK, "_cta_attrs_patched", False):
+            _found = True
+            continue
+
+        _orig_ga = vars(_CK).get("__getattr__")  # own __getattr__ only, skip MRO
+
+        def _getattr(self, name: str, _orig=_orig_ga) -> object:
+            if name in ("num_ctas", "cluster_dims", "clusterDims"):
+                # Use object.__getattribute__ to access metadata without
+                # recursing back into this __getattr__.
+                try:
+                    _meta = object.__getattribute__(self, "metadata")
+                except AttributeError:
+                    _meta = None
+                if name == "num_ctas":
+                    return getattr(_meta, "num_ctas", 1)
+                # cluster_dims / clusterDims — SM87 has no clusters → (1,1,1)
+                return getattr(_meta, "cluster_dims", (1, 1, 1))
+            if _orig is not None:
+                return _orig(self, name)
+            raise AttributeError(
+                f"'{type(self).__name__}' object has no attribute '{name}'"
+            )
+
+        try:
+            _CK.__getattr__ = _getattr
+            _CK._cta_attrs_patched = True
+            _found = True
+        except Exception:
+            pass
+
+    if _found:
         print(
-            "[compile] Patched KernelMetadata.cluster_dims=(1,1,1) on: "
-            + ", ".join(_patched_locations)
-            + "  (Jetson SM87 Ampere has no H100 thread-block cluster support)",
+            "[compile] Patched CompiledKernel.__getattr__ for cta_args "
+            "(num_ctas/cluster_dims via metadata; steers inductor away from "
+            "binary.metadata.cluster_dims on Jetson SM87)",
+            flush=True,
+        )
+    else:
+        print(
+            "[compile] WARNING: CompiledKernel not found in loaded Triton modules — "
+            "cluster_dims fix not applied",
             flush=True,
         )
 
