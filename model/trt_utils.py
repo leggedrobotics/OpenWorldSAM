@@ -79,6 +79,7 @@ def _triton_available() -> bool:
         return False
     os.environ.setdefault("TRITON_PTXAS_PATH", ptxas_path)
     _patch_triton_compiled_kernel_cta_attrs()
+    _patch_triton_kernel_metadata_cluster_dims()
     return True
 
 
@@ -139,7 +140,7 @@ def _patch_triton_compiled_kernel_cta_attrs() -> None:
             continue
         if getattr(_CK, "_cta_attrs_patched", False):
             _found = True
-            continue
+            continue  # already patched on a prior call
 
         _orig_ga = vars(_CK).get("__getattr__")  # own __getattr__ only, skip MRO
 
@@ -170,17 +171,73 @@ def _patch_triton_compiled_kernel_cta_attrs() -> None:
 
     if _found:
         print(
-            "[compile] Patched CompiledKernel.__getattr__ for cta_args "
-            "(num_ctas/cluster_dims via metadata; steers inductor away from "
-            "binary.metadata.cluster_dims on Jetson SM87)",
+            "[compile] CompiledKernel.__getattr__ patched (or already patched) for "
+            "num_ctas/cluster_dims — inductor will take Branch 1 on SM87",
             flush=True,
         )
     else:
         print(
             "[compile] WARNING: CompiledKernel not found in loaded Triton modules — "
-            "cluster_dims fix not applied",
+            "Branch 1 cluster_dims fix not applied",
             flush=True,
         )
+
+
+def _patch_triton_kernel_metadata_cluster_dims() -> None:
+    """Belt-and-suspenders: add ``cluster_dims`` to Triton's backend KernelMetadata.
+
+    ``_patch_triton_compiled_kernel_cta_attrs`` steers inductor to Branch 1
+    (``if hasattr(binary, "num_ctas")``) by patching ``CompiledKernel.__getattr__``.
+    However, the ``binary`` object at kernel-compile time may be an instance of a
+    backend-specific ``CompiledKernel`` subclass that was lazily loaded *after* the
+    ``sys.modules`` scan ran, meaning the ``__getattr__`` patch may not cover it.
+
+    This function makes Branch 2 (``binary.metadata.cluster_dims``) also safe by
+    adding ``__getattr__`` directly to ``triton.backends.nvidia.compiler.KernelMetadata``
+    — the class that ``binary.metadata`` is an instance of on Jetson.  Both branches
+    are then safe regardless of which one inductor actually takes at runtime.
+
+    On Jetson Orin (SM87), thread-block clustering is an H100/SM90-only feature,
+    so ``cluster_dims`` is always ``(1, 1, 1)``.
+    """
+    try:
+        import triton.backends.nvidia.compiler as _nvc
+    except Exception:
+        return
+
+    _KM = getattr(_nvc, "KernelMetadata", None)
+    if _KM is None:
+        print(
+            "[compile] triton.backends.nvidia.compiler.KernelMetadata not found; "
+            "Branch 2 cluster_dims fallback not applied",
+            flush=True,
+        )
+        return
+
+    if getattr(_KM, "_cluster_dims_patched", False):
+        return  # already applied on a prior call
+
+    if hasattr(_KM, "cluster_dims"):
+        return  # native field present — nothing to do
+
+    def _km_getattr(self, name: str):
+        if name in ("cluster_dims", "clusterDims"):
+            # SM87 (Jetson Orin) has no thread-block clustering → always (1,1,1)
+            return (1, 1, 1)
+        raise AttributeError(
+            f"'{type(self).__name__}' object has no attribute '{name}'"
+        )
+
+    try:
+        _KM.__getattr__ = _km_getattr
+        _KM._cluster_dims_patched = True
+        print(
+            "[compile] Patched triton.backends.nvidia.compiler.KernelMetadata.__getattr__ "
+            "— cluster_dims=(1,1,1) fallback applied for SM87 (Branch 2 safety)",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"[compile] Could not patch KernelMetadata.__getattr__: {e}", flush=True)
 
 
 import threading as _threading_mod
