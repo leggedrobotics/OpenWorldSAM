@@ -951,6 +951,14 @@ def get_trt_encoder(image_encoder: torch.nn.Module, dtype: torch.dtype, device: 
                 strict=False,
             )
 
+        # Jetson Orin uses a unified (CPU+GPU shared) memory architecture.
+        # 4 GB workspace (appropriate for discrete desktop GPUs) forces TRT to
+        # make memory-layout choices optimised for high-bandwidth GDDR — wrong
+        # for the iGPU.  Use a smaller workspace on Jetson so TRT optimises for
+        # the actual available GPU memory bandwidth.
+        _on_jetson = os.path.isfile("/etc/nv_tegra_release")
+        _workspace = 512 * 1024 ** 2 if _on_jetson else 4 * 1024 ** 3  # 512 MB / 4 GB
+
         trt_encoder = torch_tensorrt.dynamo.compile(
             exported,
             inputs=[
@@ -962,7 +970,7 @@ def get_trt_encoder(image_encoder: torch.nn.Module, dtype: torch.dtype, device: 
             enabled_precisions={dtype},
             truncate_double=True,
             device=torch.device(device),
-            workspace_size=4 * 1024 ** 3,  # 4 GB
+            workspace_size=_workspace,
             optimization_level=3,
             # Accumulate matmuls in FP32 to preserve accuracy at BF16/FP16
             use_fp32_acc=True,
