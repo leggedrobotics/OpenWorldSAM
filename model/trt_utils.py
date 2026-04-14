@@ -78,7 +78,57 @@ def _triton_available() -> bool:
     if not os.path.isfile(ptxas_path):
         return False
     os.environ.setdefault("TRITON_PTXAS_PATH", ptxas_path)
+    _patch_kernel_metadata_cluster_dims()
     return True
+
+
+def _patch_kernel_metadata_cluster_dims() -> None:
+    """Add ``cluster_dims = (1, 1, 1)`` to ``KernelMetadata`` if missing.
+
+    PyTorch 2.8 inductor accesses ``metadata.cluster_dims`` unconditionally
+    when processing compiled Triton kernels.  Thread-block clustering is a
+    Hopper (SM90 / H100) feature; Triton 3.x on aarch64 (Jetson Orin, SM87
+    Ampere) omits ``cluster_dims`` from ``KernelMetadata`` because it is
+    never used.  Setting it as a class attribute with the no-cluster default
+    ``(1, 1, 1)`` allows the inductor code path to proceed correctly.
+
+    The patch is applied to both Triton's own ``KernelMetadata`` and to any
+    ``KernelMetadata`` class inside PyTorch's inductor (the exact module path
+    changed between PyTorch 2.6 and 2.8).
+    """
+    _patched_locations: list[str] = []
+
+    # 1. Triton's KernelMetadata
+    try:
+        from triton.compiler.compiler import KernelMetadata as _KM
+        if not hasattr(_KM, "cluster_dims"):
+            _KM.cluster_dims = (1, 1, 1)
+            _patched_locations.append("triton.compiler.compiler.KernelMetadata")
+    except Exception:
+        pass
+
+    # 2. PyTorch inductor's KernelMetadata (location varies by version)
+    for _mod_path in (
+        "torch._inductor.triton_heuristics",
+        "torch._inductor.runtime.triton_heuristics",
+    ):
+        try:
+            import importlib as _il
+            _mod = _il.import_module(_mod_path)
+            _KM = getattr(_mod, "KernelMetadata", None)
+            if _KM is not None and not hasattr(_KM, "cluster_dims"):
+                _KM.cluster_dims = (1, 1, 1)
+                _patched_locations.append(f"{_mod_path}.KernelMetadata")
+        except Exception:
+            pass
+
+    if _patched_locations:
+        print(
+            "[compile] Patched KernelMetadata.cluster_dims=(1,1,1) on: "
+            + ", ".join(_patched_locations)
+            + "  (Jetson SM87 Ampere has no H100 thread-block cluster support)",
+            flush=True,
+        )
 
 
 import threading as _threading_mod
