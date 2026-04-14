@@ -207,18 +207,25 @@ def _make_locks_picklable() -> None:
 
 
 class _InductorWithCudagraphsFallback(torch.nn.Module):
-    """Wrap a torch.compile(inductor) module; fall back to cudagraphs on the first
-    forward pass if inductor raises a pickle error.
+    """Wrap a torch.compile(inductor) module; fall back to cudagraphs on the
+    first forward pass if inductor compilation fails.
 
-    torch.compile() is lazy: the returned object is a thin wrapper that triggers
-    actual kernel compilation during the FIRST forward call.  If that compilation
-    fails (e.g. because threading.RLock objects inside BEiT-3 / torchscale are
-    not picklable by torch's internal Pickler), the error surfaces at inference
-    time — not at the torch.compile() call site, so a try/except around
-    torch.compile() cannot catch it.
+    torch.compile() is lazy: actual kernel compilation happens on the FIRST
+    forward call.  Two problems prevent a simple try/except from working:
 
-    This wrapper catches the TypeError on the first call, recompiles with the
-    cudagraphs backend (no pickling required), and continues transparently.
+    1. The error surfaces at inference time (not at the torch.compile() call).
+    2. By default, dynamo SWALLOWS compilation errors (printing "backend=
+       'inductor' raised:") and silently falls back to eager — so no exception
+       ever reaches user code.  We set ``suppress_errors=False`` before
+       torch.compile() so that dynamo re-raises instead, letting us catch it.
+
+    Known failure modes on Jetson aarch64 with PyTorch 2.8:
+    - TypeError: cannot pickle '_thread.RLock' object  (inductor worker IPC)
+    - AttributeError: 'KernelMetadata' object has no attribute 'cluster_dims'
+      (Triton version mismatch — older Jetson Triton lacks cluster_dims)
+
+    On failure the wrapper transparently re-compiles with the cudagraphs
+    backend (which is always compatible) and continues without crashing.
     """
 
     def __init__(self, compiled: torch.nn.Module, original: torch.nn.Module, fullgraph: bool):
@@ -228,29 +235,32 @@ class _InductorWithCudagraphsFallback(torch.nn.Module):
         self._fullgraph = fullgraph
         self._failed = False
 
+    def _switch_to_cudagraphs(self, exc: Exception) -> None:
+        print(
+            f"[compile] inductor failed on first inference "
+            f"({type(exc).__name__}: {exc}); falling back to cudagraphs",
+            flush=True,
+        )
+        self._failed = True
+        torch._dynamo.reset()
+        try:
+            self._compiled = torch.compile(
+                self._original, backend="cudagraphs", fullgraph=self._fullgraph
+            )
+            print("[compile] fallback to torch.compile(cudagraphs) succeeded", flush=True)
+        except Exception as e2:
+            print(f"[compile] cudagraphs fallback also failed ({e2}); running eager", flush=True)
+            self._compiled = self._original
+
     def forward(self, *args, **kwargs):
         if not self._failed:
             try:
                 return self._compiled(*args, **kwargs)
-            except TypeError as exc:
-                if "pickle" in str(exc).lower() or "RLock" in str(exc):
-                    print(
-                        f"[compile] inductor pickle error on first inference ({exc}); "
-                        "falling back to cudagraphs",
-                        flush=True,
-                    )
-                    self._failed = True
-                    torch._dynamo.reset()
-                    try:
-                        self._compiled = torch.compile(
-                            self._original, backend="cudagraphs", fullgraph=self._fullgraph
-                        )
-                        print("[compile] fallback to torch.compile(cudagraphs) succeeded", flush=True)
-                    except Exception as e2:
-                        print(f"[compile] cudagraphs fallback also failed ({e2}); running eager", flush=True)
-                        self._compiled = self._original
-                else:
-                    raise
+            except Exception as exc:
+                # Catch ANY exception on the first call — inductor failures
+                # can surface as TypeError (pickle), AttributeError
+                # (KernelMetadata), or other Triton/inductor-version errors.
+                self._switch_to_cudagraphs(exc)
         return self._compiled(*args, **kwargs)
 
     # Proxy attribute access to the wrapped compiled module so that
@@ -341,12 +351,21 @@ def _torch_compile(module: torch.nn.Module, *, mode: str = "default", fullgraph:
                 _fc.enable_autograd_cache = False
         except Exception:
             pass
+        # By default dynamo swallows inductor compilation errors and silently
+        # falls back to eager (printing "backend='inductor' raised:" but not
+        # re-raising).  _InductorWithCudagraphsFallback relies on exceptions
+        # propagating to its forward() so it can switch to cudagraphs.
+        # suppress_errors=False makes dynamo re-raise instead.
+        try:
+            torch._dynamo.config.suppress_errors = False
+        except Exception:
+            pass
         try:
             compiled = torch.compile(module, mode=mode, fullgraph=fullgraph, dynamic=True)
             print("[compile] Jetson+Triton: using torch.compile(inductor, dynamic=True, single-thread)", flush=True)
-            # Wrap in a fallback shim: if the FIRST forward pass raises a pickle
-            # error (compilation is lazy, error surfaces at inference time), we
-            # transparently switch to the cudagraphs backend instead of crashing.
+            # Wrap so that ANY inductor failure on the first forward pass
+            # (TypeError, AttributeError, Triton version mismatches, etc.)
+            # triggers a transparent recompile with cudagraphs.
             return _InductorWithCudagraphsFallback(compiled, module, fullgraph)
         except Exception as e:
             print(f"[compile] inductor failed ({e}); trying cudagraphs", flush=True)
