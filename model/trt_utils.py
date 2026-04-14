@@ -722,12 +722,21 @@ def _proj_2d(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
     Supports arbitrary batch prefixes (e.g. ``[N, S, C]`` or ``[N, C]``).
     """
     shape = x.shape          # (..., S, C)
-    # reshape (not view) handles non-contiguous tensors — e.g. image-feature keys come
-    # from TwoWayTransformer which does flatten(2).permute(0,2,1), leaving strides
-    # (1048576, 1, 4096) on a [N,4096,256] tensor.  view() would fail; reshape() inserts
-    # a contiguous copy when necessary (maps to the same IShuffleLayer in TRT).
-    x_2d  = x.reshape(-1, shape[-1])       # [N*S, C]
-    out   = module(x_2d)                   # [N*S, C']
+    # Image-feature keys from TwoWayTransformer arrive with non-contiguous strides
+    # from flatten(2).permute(0,2,1).  Two strategies fail for TRT:
+    #   • x.view(-1, C)     → ValueError at export time (view requires contiguous).
+    #   • x.reshape(-1, C)  → aten._reshape_copy (fused copy+reshape SHUFFLE); TRT
+    #                          fuses this with the weight's permute SHUFFLE (weight.T)
+    #                          into a ForeignNode that has no valid kernel.
+    # Correct fix: x.contiguous().view(-1, C)
+    #   • contiguous() → aten.clone  — a data-copy op in TRT, NOT a SHUFFLE layer.
+    #   • view()        → aten.view  — a pure descriptor SHUFFLE (no data movement).
+    # TRT keeps clone and SHUFFLE separate: the view SHUFFLE folds into the matmul's
+    # input descriptor, leaving a standard IMatrixMultiplyLayer(input, weight, TRANSPOSE)
+    # that TRT compiles correctly.  For already-contiguous inputs (q, v, queries),
+    # contiguous() is a no-op at trace time so no clone is emitted.
+    x_2d  = x.contiguous().view(-1, shape[-1])   # [N*S, C]
+    out   = module(x_2d)                          # [N*S, C']
     return out.view(*shape[:-1], out.shape[-1])   # [..., S, C'] (out is always contiguous)
 
 
