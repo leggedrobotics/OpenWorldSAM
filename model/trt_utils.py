@@ -884,6 +884,12 @@ def _two_way_transformer_forward_patched(
     pure descriptor SHUFFLE with no data movement).  TRT then sees the standard
     ``view → IMatrixMultiplyLayer(weight, TRANSPOSE)`` pattern it can compile.
     """
+    # One-time diagnostic: confirm this patched path is being traced (not the
+    # original TwoWayTransformer.forward).  Printed only during torch.export,
+    # not at every inference call, because the module is replaced by the TRT engine.
+    if not getattr(self, "_trt_patch_logged", False):
+        print("[TRT] TwoWayTransformer forward patch active (contiguous image keys)")
+        object.__setattr__(self, "_trt_patch_logged", True)
     bs, c, h, w = image_embedding.shape
     image_embedding = image_embedding.flatten(2).permute(0, 2, 1).contiguous()
     image_pe        = image_pe.flatten(2).permute(0, 2, 1).contiguous()
@@ -908,17 +914,15 @@ def _two_way_transformer_forward_patched(
 
 
 def _patch_two_way_transformer(module: nn.Module) -> int:
-    """Patch TwoWayTransformer.forward to produce contiguous image-key tensors."""
-    try:
-        from model.segment_anything_2.sam2.modeling.sam.transformer import TwoWayTransformer
-    except ImportError:
-        try:
-            from sam2.modeling.sam.transformer import TwoWayTransformer
-        except ImportError:
-            return 0
+    """Patch TwoWayTransformer.forward to produce contiguous image-key tensors.
+
+    Uses a name-based check (``type(mod).__name__``) rather than ``isinstance``
+    to avoid false negatives when the same class is imported via two different
+    Python paths (e.g. ``model.segment_anything_2.sam2.*`` vs ``sam2.*``).
+    """
     patched = 0
     for mod in module.modules():
-        if isinstance(mod, TwoWayTransformer):
+        if type(mod).__name__ == "TwoWayTransformer":
             mod.forward = types.MethodType(_two_way_transformer_forward_patched, mod)
             patched += 1
     return patched
