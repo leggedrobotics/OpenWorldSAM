@@ -722,9 +722,13 @@ def _proj_2d(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
     Supports arbitrary batch prefixes (e.g. ``[N, S, C]`` or ``[N, C]``).
     """
     shape = x.shape          # (..., S, C)
-    x_2d  = x.view(-1, shape[-1])          # [N*S, C]
+    # reshape (not view) handles non-contiguous tensors — e.g. image-feature keys come
+    # from TwoWayTransformer which does flatten(2).permute(0,2,1), leaving strides
+    # (1048576, 1, 4096) on a [N,4096,256] tensor.  view() would fail; reshape() inserts
+    # a contiguous copy when necessary (maps to the same IShuffleLayer in TRT).
+    x_2d  = x.reshape(-1, shape[-1])       # [N*S, C]
     out   = module(x_2d)                   # [N*S, C']
-    return out.view(*shape[:-1], out.shape[-1])   # [..., S, C']
+    return out.view(*shape[:-1], out.shape[-1])   # [..., S, C'] (out is always contiguous)
 
 
 def _attention_forward_patched(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
