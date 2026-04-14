@@ -781,11 +781,12 @@ def _two_way_attn_block_forward_patched(
     queries = self.norm3(queries)
 
     # Cross attention block, image embedding attending to tokens
-    # After the token→image block, keys_n is [N,4096,256]; expand to match queries.
-    # Use keys_n so this block always sees [N,...] rather than [1,...].
+    # keys_n is already [N,4096,256] (expanded at the top of this function).
+    # Use keys_n explicitly rather than keys to avoid any stale [1,...] reference
+    # if this block is called with keys still at batch=1 in a different code path.
     k = keys_n + key_pe_n
     attn_out = self.cross_attn_image_to_token(q=k, k=queries + query_pe, v=queries)
-    keys = keys + attn_out
+    keys = keys_n + attn_out
     keys = self.norm4(keys)
 
     return queries, keys
@@ -866,6 +867,12 @@ def _predict_masks_patched(
     else:
         dc1, ln1, act1, dc2, act2 = self.output_upscaling
         feat_s0, feat_s1 = high_res_features
+        # FIX: explicitly expand static [1, C, H, W] backbone features to [N, C, H, W]
+        # before element-wise addition.  Without this, TRT sees an implicit broadcast
+        # ([N, C, H, W] + [1, C, H, W]) which it may fuse with surrounding SHUFFLE layers
+        # into a ForeignNode with no valid kernel when N is a dynamic symbolic dim.
+        feat_s1 = feat_s1.expand(N, -1, -1, -1)
+        feat_s0 = feat_s0.expand(N, -1, -1, -1)
         upscaled_embedding = act1(ln1(dc1(src) + feat_s1))
         upscaled_embedding = act2(dc2(upscaled_embedding) + feat_s0)
 
