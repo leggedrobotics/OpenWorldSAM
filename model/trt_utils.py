@@ -205,10 +205,27 @@ def _patch_triton_kernel_metadata_cluster_dims() -> None:
     except Exception:
         return
 
+    # Class name varies across Triton versions and Jetson builds.
+    # Scan all classes in the module for ones that look like kernel metadata:
+    # namedtuples have _fields; dataclasses have __annotations__.
+    # Characteristic fields: num_ctas, num_warps, shared (always present in metadata).
     _KM = getattr(_nvc, "KernelMetadata", None)
     if _KM is None:
+        _meta_fields = {"num_ctas", "num_warps", "shared", "cluster_dims", "num_stages"}
+        for _attr_name in dir(_nvc):
+            try:
+                _cls = getattr(_nvc, _attr_name)
+                if not isinstance(_cls, type):
+                    continue
+                _fields = set(getattr(_cls, "_fields", None) or getattr(_cls, "__annotations__", {}).keys())
+                if _fields & _meta_fields:  # at least one characteristic field present
+                    _KM = _cls
+                    break
+            except Exception:
+                continue
+    if _KM is None:
         print(
-            "[compile] triton.backends.nvidia.compiler.KernelMetadata not found; "
+            "[compile] triton.backends.nvidia.compiler: no KernelMetadata-like class found; "
             "Branch 2 cluster_dims fallback not applied",
             flush=True,
         )
@@ -687,6 +704,29 @@ def _apply_trt_patches(image_encoder: nn.Module) -> None:
 # Decoder patches — removes non-traceable context manager and dynamic-b reshapes
 # ---------------------------------------------------------------------------
 
+def _proj_2d(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Apply a Linear-containing module to a 3D tensor via a 2D reshape.
+
+    When ``torch.export`` traces ``nn.Linear`` on a 3D input ``[N, S, C]`` with
+    dynamic batch N it generates::
+
+        weight.unsqueeze(0).expand(N, ...) followed by bmm
+
+    TRT fuses this weight-broadcast with any subsequent SHUFFLE ops (``unflatten``,
+    ``transpose``) into a ``ForeignNode`` for which no valid kernel exists when N is
+    a symbolic dynamic dimension.
+
+    Reshaping to ``[N*S, C]`` first uses the native 2D ``IMatrixMultiplyLayer``
+    path — the weight is never broadcast — then the output is reshaped back.
+
+    Supports arbitrary batch prefixes (e.g. ``[N, S, C]`` or ``[N, C]``).
+    """
+    shape = x.shape          # (..., S, C)
+    x_2d  = x.view(-1, shape[-1])          # [N*S, C]
+    out   = module(x_2d)                   # [N*S, C']
+    return out.view(*shape[:-1], out.shape[-1])   # [..., S, C']
+
+
 def _attention_forward_patched(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """Attention.forward without the non-traceable sdp_kernel context manager.
 
@@ -696,10 +736,16 @@ def _attention_forward_patched(self, q: torch.Tensor, k: torch.Tensor, v: torch.
     causes TRT to fuse the ops into a ForeignNode with no valid kernel when the
     batch dim (b = vocab_size) is a dynamic symbolic dimension.  Using only
     last-dim operations avoids this.
+
+    All linear projections (q/k/v/out) are applied via ``_proj_2d`` which avoids
+    a second ForeignNode: ``nn.Linear`` on a 3D input with dynamic batch N traces
+    as weight.expand(N,...)+bmm which TRT fuses with subsequent SHUFFLE ops
+    (unflatten, transpose) into an uncompilable node.  Projecting via a 2D reshape
+    uses the native IMatrixMultiplyLayer path instead.
     """
-    q = self.q_proj(q)
-    k = self.k_proj(k)
-    v = self.v_proj(v)
+    q = _proj_2d(self.q_proj, q)
+    k = _proj_2d(self.k_proj, k)
+    v = _proj_2d(self.v_proj, v)
     head_dim = q.shape[-1] // self.num_heads
     # separate heads: [B, N, C] -> [B, heads, N, head_dim]
     q = q.unflatten(-1, [self.num_heads, head_dim]).transpose(1, 2)
@@ -710,7 +756,7 @@ def _attention_forward_patched(self, q: torch.Tensor, k: torch.Tensor, v: torch.
     out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
     # recombine heads: [B, heads, N, head_dim] -> [B, N, C]
     out = out.transpose(1, 2).flatten(-2)
-    out = self.out_proj(out)
+    out = _proj_2d(self.out_proj, out)
     return out
 
 
@@ -775,8 +821,9 @@ def _two_way_attn_block_forward_patched(
     queries = queries + attn_out
     queries = self.norm2(queries)
 
-    # MLP block
-    mlp_out = self.mlp(queries)
+    # MLP block — use _proj_2d to avoid weight-broadcast ForeignNode when queries
+    # is [N, T_tokens, C] with dynamic N (same issue as linear projections in Attention).
+    mlp_out = _proj_2d(self.mlp, queries)
     queries = queries + mlp_out
     queries = self.norm3(queries)
 
