@@ -265,6 +265,9 @@ def _patch_triton_kernel_metadata_cluster_dims() -> None:
         print(f"[compile] Could not patch KernelMetadata.__getattr__: {e}", flush=True)
 
 
+import threading as _threading_mod
+
+
 def _triton_probe_compile() -> bool:
     """Return True if Triton can JIT-compile and run a trivial kernel on the current GPU.
 
@@ -292,9 +295,6 @@ def _triton_probe_compile() -> bool:
         print(f"[compile] Triton probe failed ({type(e).__name__}: {e}); "
               "torch.compile will use cudagraphs instead of inductor", flush=True)
         return False
-
-
-import threading as _threading_mod
 
 
 class _PicklableRLock:
@@ -1399,10 +1399,15 @@ def _try_trt_decoder(
     _N_opt = min(5 * _num_tokens, max_n_prompts)   # 5 classes (typical)
     _N_max = max_n_prompts          # generous upper bound
 
-    # Jetson unified-memory workspace.
-    # Thor (SM_110, 64 GB): 2 GB; Orin (SM_87, 32 GB): 512 MB
-    _sm = torch.cuda.get_device_capability(torch.device(device))
-    _workspace = (2 * 1024 ** 3) if _sm[0] >= 11 else (512 * 1024 ** 2)
+    # Jetson unified-memory workspace; _try_trt_decoder is only called from
+    # get_trt_decoder() when _on_jetson is True, but mirror encoder structure for consistency.
+    _on_jetson_dec = os.path.isfile("/etc/nv_tegra_release")
+    if _on_jetson_dec:
+        _sm = torch.cuda.get_device_capability(torch.device(device))
+        # Thor (SM_110, 64 GB): 2 GB; Orin (SM_87, 32 GB): 512 MB
+        _workspace = (2 * 1024 ** 3) if _sm[0] >= 11 else (512 * 1024 ** 2)
+    else:
+        _workspace = 4 * 1024 ** 3
 
     _dev = torch.device(device)
     eg_image_emb   = torch.zeros(1,       256,  64,  64, dtype=dtype, device=_dev)
