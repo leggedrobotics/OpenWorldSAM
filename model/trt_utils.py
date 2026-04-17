@@ -78,6 +78,14 @@ def _triton_available() -> bool:
     if not os.path.isfile(ptxas_path):
         return False
     os.environ.setdefault("TRITON_PTXAS_PATH", ptxas_path)
+
+    # Blackwell (SM >= 11.0): some ptxas builds reject sm_110a at JIT time.
+    # Run a live compile probe instead of a static binary check.
+    if torch.cuda.is_available():
+        sm = torch.cuda.get_device_capability()
+        if sm[0] >= 11 and not _triton_probe_compile():
+            return False
+
     _patch_triton_compiled_kernel_cta_attrs()
     _patch_triton_kernel_metadata_cluster_dims()
     return True
@@ -255,6 +263,35 @@ def _patch_triton_kernel_metadata_cluster_dims() -> None:
         )
     except Exception as e:
         print(f"[compile] Could not patch KernelMetadata.__getattr__: {e}", flush=True)
+
+
+def _triton_probe_compile() -> bool:
+    """Return True if Triton can JIT-compile and run a trivial kernel on the current GPU.
+
+    Blackwell (SM_110 / sm_110a) known issue: some ptxas builds bundled with
+    JetPack 7.0 only recognise sm_121 (DGX Spark) and reject sm_110a with:
+        ptxas-blackwell fatal: Value 'sm_110a' is not defined for option 'gpu-name'
+    A static ptxas --version check cannot detect this; a live kernel compile does.
+    The probe runs at model-init time so failures redirect to cudagraphs before
+    any segmentation inference attempt.
+    """
+    try:
+        import triton
+        import triton.language as tl
+
+        @triton.jit
+        def _noop(x_ptr, BLOCK: tl.constexpr):
+            pid = tl.program_id(axis=0)
+            x = tl.load(x_ptr + pid * BLOCK)
+            tl.store(x_ptr + pid * BLOCK, x)
+
+        x = torch.ones(1, device="cuda", dtype=torch.float32)
+        _noop[(1,)](x, BLOCK=1)
+        return True
+    except Exception as e:
+        print(f"[compile] Triton probe failed ({type(e).__name__}: {e}); "
+              "torch.compile will use cudagraphs instead of inductor", flush=True)
+        return False
 
 
 import threading as _threading_mod
@@ -1139,7 +1176,12 @@ def get_trt_encoder(image_encoder: torch.nn.Module, dtype: torch.dtype, device: 
         # for the iGPU.  Use a smaller workspace on Jetson so TRT optimises for
         # the actual available GPU memory bandwidth.
         _on_jetson = os.path.isfile("/etc/nv_tegra_release")
-        _workspace = 512 * 1024 ** 2 if _on_jetson else 4 * 1024 ** 3  # 512 MB / 4 GB
+        if _on_jetson:
+            _sm = torch.cuda.get_device_capability(torch.device(device))
+            # Thor (SM_110, 64 GB unified memory) → 2 GB; Orin (SM_87, 32 GB) → 512 MB
+            _workspace = (2 * 1024 ** 3) if _sm[0] >= 11 else (512 * 1024 ** 2)
+        else:
+            _workspace = 4 * 1024 ** 3
 
         trt_encoder = torch_tensorrt.dynamo.compile(
             exported,
@@ -1357,8 +1399,10 @@ def _try_trt_decoder(
     _N_opt = min(5 * _num_tokens, max_n_prompts)   # 5 classes (typical)
     _N_max = max_n_prompts          # generous upper bound
 
-    # Jetson unified-memory: 512 MB workspace avoids discrete-GPU layout choices.
-    _workspace = 512 * 1024 ** 2
+    # Jetson unified-memory workspace.
+    # Thor (SM_110, 64 GB): 2 GB; Orin (SM_87, 32 GB): 512 MB
+    _sm = torch.cuda.get_device_capability(torch.device(device))
+    _workspace = (2 * 1024 ** 3) if _sm[0] >= 11 else (512 * 1024 ** 2)
 
     _dev = torch.device(device)
     eg_image_emb   = torch.zeros(1,       256,  64,  64, dtype=dtype, device=_dev)
