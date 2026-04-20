@@ -1035,23 +1035,31 @@ def _predict_masks_patched(
     else:
         dc1, ln1, act1, dc2, act2 = self.output_upscaling
         feat_s0, feat_s1 = high_res_features
-        # BF16 ConvTranspose2d (DECONV) fails TRT type inference on SM_110 Blackwell:
-        # tactic 0x0 raises type.cpp:186 infer_type and all other tactics also fail.
-        # Fix: cast input and weights to FP32 for the two DECONV calls, then cast
-        # output back to the original dtype.  TRT FP32 DECONV is well-supported on
-        # all architectures.  For FP32 models the .float() / .to(dtype) are no-ops.
-        _dtype = src.dtype
-        _dc1_bias = dc1.bias.float() if dc1.bias is not None else None
-        _dc2_bias = dc2.bias.float() if dc2.bias is not None else None
-        _deconv1 = F.conv_transpose2d(
-            src.float(), dc1.weight.float(), _dc1_bias,
-            dc1.stride, dc1.padding, dc1.output_padding, dc1.groups, dc1.dilation,
-        ).to(_dtype)
-        upscaled_embedding = act1(ln1(_deconv1 + feat_s1))
-        _deconv2 = F.conv_transpose2d(
-            upscaled_embedding.float(), dc2.weight.float(), _dc2_bias,
-            dc2.stride, dc2.padding, dc2.output_padding, dc2.groups, dc2.dilation,
-        ).to(_dtype)
+        # SM_110 (Blackwell) TRT cannot compile BF16 ConvTranspose2d: all tactics
+        # fail with type.cpp:186 infer_type.  Fix: cast to FP32 for the two DECONV
+        # calls and cast back.  SM_87 (Orin) supports BF16 DECONV natively so the
+        # cast is skipped there to avoid the unnecessary type-conversion overhead.
+        # The capability check is evaluated at torch.export / torch.compile trace
+        # time so the correct branch is baked into the compiled graph.
+        _sm_major = torch.cuda.get_device_capability(src.device)[0]
+        _need_fp32_deconv = (_sm_major >= 11) and (src.dtype == torch.bfloat16)
+        if _need_fp32_deconv:
+            _dtype = src.dtype
+            _dc1_bias = dc1.bias.float() if dc1.bias is not None else None
+            _dc2_bias = dc2.bias.float() if dc2.bias is not None else None
+            _deconv1 = F.conv_transpose2d(
+                src.float(), dc1.weight.float(), _dc1_bias,
+                dc1.stride, dc1.padding, dc1.output_padding, dc1.groups, dc1.dilation,
+            ).to(_dtype)
+            upscaled_embedding = act1(ln1(_deconv1 + feat_s1))
+            _deconv2 = F.conv_transpose2d(
+                upscaled_embedding.float(), dc2.weight.float(), _dc2_bias,
+                dc2.stride, dc2.padding, dc2.output_padding, dc2.groups, dc2.dilation,
+            ).to(_dtype)
+        else:
+            _deconv1 = dc1(src)
+            upscaled_embedding = act1(ln1(_deconv1 + feat_s1))
+            _deconv2 = dc2(upscaled_embedding)
         upscaled_embedding = act2(_deconv2 + feat_s0)
 
     hyper_in_list = []
