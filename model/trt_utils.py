@@ -1170,6 +1170,42 @@ def get_trt_encoder(image_encoder: torch.nn.Module, dtype: torch.dtype, device: 
                 strict=False,
             )
 
+        # Pre-strip aten assert nodes before torch_tensorrt.dynamo.compile().
+        # PyTorch 2.10 + torch_tensorrt 2.10 bug on Jetson SBSA: the internal
+        # remove_assert_nodes pass calls erase_node() on _assert_scalar /
+        # _assert_tensor_metadata nodes.  erase_node() calls _update_args_kwargs
+        # at C level which hits KeyError on a stale 'select_3' node reference,
+        # causing a SystemError that aborts compilation entirely.
+        # Removing these nodes here means remove_assert_nodes finds nothing to
+        # erase, bypassing the bug without affecting model correctness.
+        _assert_targets = {
+            torch.ops.aten._assert_scalar.default,
+            torch.ops.aten._assert_tensor_metadata.default,
+        }
+        _nodes_to_strip = [
+            _n for _n in exported.graph_module.graph.nodes
+            if _n.target in _assert_targets
+        ]
+        if _nodes_to_strip:
+            for _n in list(_nodes_to_strip):
+                # Manually unlink from input nodes' users maps, then clear args,
+                # so _update_args_kwargs at C level has no stale references.
+                for _inp in list(_n.all_input_nodes):
+                    _inp.users.pop(_n, None)
+                object.__setattr__(_n, "_args", ())
+                object.__setattr__(_n, "_kwargs", {})
+                try:
+                    exported.graph_module.graph.erase_node(_n)
+                except Exception:
+                    pass
+            try:
+                exported.graph_module.graph.eliminate_dead_code()
+                exported.graph_module.graph.lint()
+                exported.graph_module.recompile()
+            except Exception:
+                pass
+            print(f"[TRT] Pre-stripped {len(_nodes_to_strip)} assert nodes from encoder graph")
+
         # Jetson Orin uses a unified (CPU+GPU shared) memory architecture.
         # 4 GB workspace (appropriate for discrete desktop GPUs) forces TRT to
         # make memory-layout choices optimised for high-bandwidth GDDR — wrong
@@ -1404,8 +1440,9 @@ def _try_trt_decoder(
     _on_jetson_dec = os.path.isfile("/etc/nv_tegra_release")
     if _on_jetson_dec:
         _sm = torch.cuda.get_device_capability(torch.device(device))
-        # Thor (SM_110, 64 GB): 2 GB; Orin (SM_87, 32 GB): 512 MB
-        _workspace = (2 * 1024 ** 3) if _sm[0] >= 11 else (512 * 1024 ** 2)
+        # Thor (SM_110, 122 GB): 8 GB — decoder needs >2 GB for some tactics;
+        # Orin (SM_87, 32 GB): 512 MB
+        _workspace = (8 * 1024 ** 3) if _sm[0] >= 11 else (512 * 1024 ** 2)
     else:
         _workspace = 4 * 1024 ** 3
 
@@ -1437,6 +1474,33 @@ def _try_trt_decoder(
                 },
                 strict=False,
             )
+
+        # Same assert-node pre-strip as in get_trt_encoder (see comment there).
+        _assert_targets_dec = {
+            torch.ops.aten._assert_scalar.default,
+            torch.ops.aten._assert_tensor_metadata.default,
+        }
+        _nodes_to_strip_dec = [
+            _n for _n in exported.graph_module.graph.nodes
+            if _n.target in _assert_targets_dec
+        ]
+        if _nodes_to_strip_dec:
+            for _n in list(_nodes_to_strip_dec):
+                for _inp in list(_n.all_input_nodes):
+                    _inp.users.pop(_n, None)
+                object.__setattr__(_n, "_args", ())
+                object.__setattr__(_n, "_kwargs", {})
+                try:
+                    exported.graph_module.graph.erase_node(_n)
+                except Exception:
+                    pass
+            try:
+                exported.graph_module.graph.eliminate_dead_code()
+                exported.graph_module.graph.lint()
+                exported.graph_module.recompile()
+            except Exception:
+                pass
+            print(f"[TRT] Pre-stripped {len(_nodes_to_strip_dec)} assert nodes from decoder graph")
 
         trt_decoder = torch_tensorrt.dynamo.compile(
             exported,
