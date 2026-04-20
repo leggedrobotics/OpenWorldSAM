@@ -798,7 +798,10 @@ def _attention_forward_patched(self, q: torch.Tensor, k: torch.Tensor, v: torch.
     # Drop the non-traceable context manager; PyTorch will auto-select the best kernel.
     out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
     # recombine heads: [B, heads, N, head_dim] -> [B, N, C]
-    out = out.transpose(1, 2).flatten(-2)
+    # .contiguous() after transpose ensures flatten traces as aten.view (pure
+    # descriptor SHUFFLE) rather than aten._reshape_copy (copy SHUFFLE that TRT
+    # fuses with adjacent ops into an uncompilable ForeignNode).
+    out = out.transpose(1, 2).contiguous().flatten(-2)
     out = _proj_2d(self.out_proj, out)
     return out
 
@@ -855,9 +858,13 @@ def _two_way_attn_block_forward_patched(
     queries = self.norm1(queries)
 
     # Cross attention block, tokens attending to image embedding
-    # Expand image features to N to avoid implicit SDPA broadcast → TRT ForeignNode
-    keys_n = keys.expand(N, -1, -1)
-    key_pe_n = key_pe.expand(N, -1, -1)
+    # Expand image features to N to avoid implicit SDPA broadcast → TRT ForeignNode.
+    # .contiguous() forces the expanded view into a dense layout so _proj_2d's
+    # view() traces as aten.view (descriptor SHUFFLE) rather than aten._reshape_copy
+    # (copy SHUFFLE), which TRT fuses with surrounding ops into an uncompilable
+    # ForeignNode when the batch dim N is dynamic.
+    keys_n = keys.expand(N, -1, -1).contiguous()
+    key_pe_n = key_pe.expand(N, -1, -1).contiguous()
     q = queries + query_pe
     k = keys_n + key_pe_n
     attn_out = self.cross_attn_token_to_image(q=q, k=k, v=keys_n)
@@ -1000,36 +1007,52 @@ def _predict_masks_patched(
         s = 1
     else:
         output_tokens = torch.cat([self.iou_token.weight, self.mask_tokens.weight], dim=0)
-    output_tokens = output_tokens.unsqueeze(0).expand(sparse_prompt_embeddings.size(0), -1, -1)
+    # .contiguous() materialises the expand into a dense tensor so TRT sees a plain
+    # IExpandLayer with no stride=0 dims — breaking the ForeignNode that forms when
+    # the expand feeds through the transformer into the DECONV shape-tensor path.
+    output_tokens = output_tokens.unsqueeze(0).expand(sparse_prompt_embeddings.size(0), -1, -1).contiguous()
     tokens = torch.cat((output_tokens, sparse_prompt_embeddings), dim=1)
 
-    # FIX: expand instead of repeat_interleave — TRT handles broadcast natively
-    # without decomposing into reshape+tile+reshape, which fails with dynamic N.
-    N = tokens.shape[0]  # dynamic
-    src = image_embeddings.expand(N, -1, -1, -1)
-    src = src + dense_prompt_embeddings
-    pos_src = image_pe.expand(N, -1, -1, -1)
-    _, c, h, w = image_embeddings.shape  # use static shape; b=1 always
+    N = sparse_prompt_embeddings.shape[0]
+    # image_embeddings and image_pe are already [N, C, H, W] (pre-expanded by
+    # _DecoderWrapper.forward) — no expand needed here.
+    src = image_embeddings + dense_prompt_embeddings
+    pos_src = image_pe
+    _, c, h, w = image_embeddings.shape
 
     hs, src = self.transformer(src, pos_src, tokens)
     iou_token_out = hs[:, s, :]
     mask_tokens_out = hs[:, s + 1 : (s + 1 + self.num_mask_tokens), :]
 
-    # FIX: unflatten(-1, [h, w]) — only reshapes the last dim, never touches dynamic b
-    src = src.transpose(1, 2).unflatten(-1, [h, w])
+    # unflatten(-1, [h, w]) ONLY splits the last dimension of [N, C, H*W].
+    # Critically it never references N as an argument, so TRT's shape-tensor path
+    # never traces back through N's producer chain (expand → ForeignNode).
+    # The earlier view(N, 256, h, w) passed N explicitly, causing TRT to resolve
+    # it as a shape tensor → hit the expand chain → ForeignNode → DECONV type fail.
+    src = src.transpose(1, 2).contiguous().unflatten(-1, [h, w])
     if not self.use_high_res_features:
         upscaled_embedding = self.output_upscaling(src)
     else:
         dc1, ln1, act1, dc2, act2 = self.output_upscaling
         feat_s0, feat_s1 = high_res_features
-        # FIX: explicitly expand static [1, C, H, W] backbone features to [N, C, H, W]
-        # before element-wise addition.  Without this, TRT sees an implicit broadcast
-        # ([N, C, H, W] + [1, C, H, W]) which it may fuse with surrounding SHUFFLE layers
-        # into a ForeignNode with no valid kernel when N is a dynamic symbolic dim.
-        feat_s1 = feat_s1.expand(N, -1, -1, -1)
-        feat_s0 = feat_s0.expand(N, -1, -1, -1)
-        upscaled_embedding = act1(ln1(dc1(src) + feat_s1))
-        upscaled_embedding = act2(dc2(upscaled_embedding) + feat_s0)
+        # BF16 ConvTranspose2d (DECONV) fails TRT type inference on SM_110 Blackwell:
+        # tactic 0x0 raises type.cpp:186 infer_type and all other tactics also fail.
+        # Fix: cast input and weights to FP32 for the two DECONV calls, then cast
+        # output back to the original dtype.  TRT FP32 DECONV is well-supported on
+        # all architectures.  For FP32 models the .float() / .to(dtype) are no-ops.
+        _dtype = src.dtype
+        _dc1_bias = dc1.bias.float() if dc1.bias is not None else None
+        _dc2_bias = dc2.bias.float() if dc2.bias is not None else None
+        _deconv1 = F.conv_transpose2d(
+            src.float(), dc1.weight.float(), _dc1_bias,
+            dc1.stride, dc1.padding, dc1.output_padding, dc1.groups, dc1.dilation,
+        ).to(_dtype)
+        upscaled_embedding = act1(ln1(_deconv1 + feat_s1))
+        _deconv2 = F.conv_transpose2d(
+            upscaled_embedding.float(), dc2.weight.float(), _dc2_bias,
+            dc2.stride, dc2.padding, dc2.output_padding, dc2.groups, dc2.dilation,
+        ).to(_dtype)
+        upscaled_embedding = act2(_deconv2 + feat_s0)
 
     hyper_in_list = []
     for i in range(self.num_mask_tokens):
@@ -1091,16 +1114,27 @@ class _DecoderWrapper(nn.Module):
         high_res_s1: torch.Tensor,        # [1, 64, 128, 128]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         N = sparse_embeddings.shape[0]
+        # Pre-expand ALL [1, C, H, W] tensors to [N, C, H, W] here so that
+        # predict_masks receives batched inputs and contains NO expand ops.
+        # TRT on SM_110 cannot execute the ForeignNode it creates when any
+        # expand inside predict_masks feeds (through the transformer + slice)
+        # into the shape-tensor path of the output_upscaling DECONVOLUTION.
+        # Moving every expand to the wrapper level keeps predict_masks free of
+        # ISliceLayer-sourced shape tensors, giving TRT a clean static graph.
+        image_emb_n  = image_embeddings.expand(N, -1, -1, -1).contiguous()
+        image_pe_n   = image_pe.expand(N, -1, -1, -1).contiguous()
+        feat_s0_n    = high_res_s0.expand(N, -1, -1, -1).contiguous()
+        feat_s1_n    = high_res_s1.expand(N, -1, -1, -1).contiguous()
         dense_embeddings = self.no_mask_embed.expand(
             N, -1, image_embeddings.shape[2], image_embeddings.shape[3]
-        )
+        ).contiguous()
         masks, iou_pred, _, _ = self.decoder.predict_masks(
-            image_embeddings=image_embeddings,
-            image_pe=image_pe,
+            image_embeddings=image_emb_n,
+            image_pe=image_pe_n,
             sparse_prompt_embeddings=sparse_embeddings,
             dense_prompt_embeddings=dense_embeddings,
             repeat_image=True,
-            high_res_features=[high_res_s0, high_res_s1],
+            high_res_features=[feat_s0_n, feat_s1_n],
         )
         # Return single-mask slice (multimask_output=False path)
         return masks[:, 0:1, :, :], iou_pred[:, 0:1]
@@ -1219,6 +1253,13 @@ def get_trt_encoder(image_encoder: torch.nn.Module, dtype: torch.dtype, device: 
         else:
             _workspace = 4 * 1024 ** 3
 
+        # torch_tensorrt 2.10+: use_explicit_typing defaults to True, which encodes
+        # per-op dtypes from the exported graph directly.  Passing enabled_precisions
+        # with a non-FP32/FP4 dtype (e.g. bfloat16) then raises AssertionError.
+        # For BF16/FP16 the precision is already in the network definition, so omit
+        # enabled_precisions.  Only pass it for FP32 to constrain TRT to full precision.
+        _enc_precision = {} if dtype != torch.float32 else {"enabled_precisions": {torch.float32}}
+
         trt_encoder = torch_tensorrt.dynamo.compile(
             exported,
             inputs=[
@@ -1227,7 +1268,7 @@ def get_trt_encoder(image_encoder: torch.nn.Module, dtype: torch.dtype, device: 
                     dtype=dtype,
                 )
             ],
-            enabled_precisions={dtype},
+            **_enc_precision,
             truncate_double=True,
             device=torch.device(device),
             workspace_size=_workspace,
@@ -1248,6 +1289,44 @@ def get_trt_encoder(image_encoder: torch.nn.Module, dtype: torch.dtype, device: 
         traceback.print_exc()
         print("[TRT] Falling back to torch.compile")
         return _torch_compile(image_encoder, mode="default", fullgraph=False)
+
+
+class _StaticTRTDecoder(nn.Module):
+    """TRT decoder compiled with a fixed N, with torch.compile fallback.
+
+    When the runtime sparse_embeddings batch dim matches ``static_n`` the fast
+    TRT engine is used.  Any other N (e.g. after a vocab-size change) falls back
+    to the torch.compile path so inference never hard-errors.
+
+    Controlled by ``OWSAM_NUM_CLASSES`` × ``OWSAM_NUM_TOKENS`` (default 5 × 20 = 100).
+    """
+
+    def __init__(
+        self,
+        trt_module: nn.Module,
+        fallback_module: nn.Module,
+        static_n: int,
+    ) -> None:
+        super().__init__()
+        self.trt_module = trt_module
+        self.fallback_module = fallback_module
+        self.static_n = static_n
+
+    def forward(
+        self,
+        image_embeddings: torch.Tensor,
+        image_pe: torch.Tensor,
+        sparse_embeddings: torch.Tensor,
+        high_res_s0: torch.Tensor,
+        high_res_s1: torch.Tensor,
+    ) -> tuple:
+        if sparse_embeddings.shape[0] == self.static_n:
+            return self.trt_module(
+                image_embeddings, image_pe, sparse_embeddings, high_res_s0, high_res_s1
+            )
+        return self.fallback_module(
+            image_embeddings, image_pe, sparse_embeddings, high_res_s0, high_res_s1
+        )
 
 
 class _TRTDecoderAdapter(nn.Module):
@@ -1358,13 +1437,24 @@ def get_trt_decoder(
         f"LayerNorm2d×{n_ln}, TwoWayTransformer×{n_transformer}"
     )
 
-    # On Jetson, attempt TRT compilation first.
+    # On Jetson, attempt static-N TRT compilation first.
+    # Static N eliminates the ForeignNode caused by dynamic N propagating through
+    # the TwoWayTransformer expand+slice chain.  OWSAM_NUM_CLASSES × OWSAM_NUM_TOKENS
+    # sets the fixed N; the torch.compile fallback handles any other vocab size.
     _on_jetson = os.path.isfile("/etc/nv_tegra_release")
     if _on_jetson:
-        _trt = _try_trt_decoder(wrapper, dtype, device, max_n_prompts)
+        try:
+            _n_cls = int(os.environ.get("OWSAM_NUM_CLASSES", "5"))
+            _n_tok = int(os.environ.get("OWSAM_NUM_TOKENS", "20"))
+        except ValueError:
+            _n_cls, _n_tok = 5, 20
+        n_static = _n_cls * _n_tok
+        _trt = _try_trt_decoder(wrapper, dtype, device, max_n_prompts, n_static=n_static)
         if _trt is not None:
-            print("[TRT] Decoder compiled (TensorRT)", flush=True)
-            return _trt
+            print(f"[TRT] Decoder compiled (TensorRT static N={n_static})", flush=True)
+            # Build a torch.compile fallback for vocab sizes other than n_static
+            _fallback = _torch_compile(wrapper, mode="default", fullgraph=False)
+            return _StaticTRTDecoder(_trt, _fallback, n_static)
         print("[TRT] TRT decoder failed; falling back to torch.compile", flush=True)
 
     # Fallback: torch.compile with inductor/cudagraphs backend.
@@ -1380,6 +1470,7 @@ def _try_trt_decoder(
     dtype: torch.dtype,
     device: str,
     max_n_prompts: int,
+    n_static: "int | None" = None,
 ) -> "nn.Module | None":
     """Attempt TRT compilation of the patched ``_DecoderWrapper``.
 
@@ -1389,15 +1480,17 @@ def _try_trt_decoder(
     Shape assumptions (verified against open_world_sam2.py):
       - image_embeddings:  [1, 256, 64, 64]   — static (SAM2 backbone output)
       - image_pe:          [1, 256, 64, 64]   — static (dense positional encoding)
-      - sparse_embeddings: [N, 1, 256]        — N dynamic; T=1 (prompt encoder
-                                                outputs one 256-d embedding per slot)
+      - sparse_embeddings: [N, 1, 256]        — N = vocab_size × num_tokens
       - high_res_s0:       [1, 32, 256, 256]  — static (FPN level 0)
       - high_res_s1:       [1, 64, 128, 128]  — static (FPN level 1)
 
-    N = vocab_size × num_tokens.  Shape profile:
-      min = num_tokens    (single class)
-      opt = 5 × num_tokens (typical 5-class scene)
-      max = max_n_prompts  (generous upper bound, default 400)
+    When ``n_static`` is provided the decoder is exported with fully static shapes
+    (no dynamic dims).  Static shapes eliminate all ForeignNode errors: the expand
+    ops inside the TwoWayTransformer that taint N's symbolic path become trivially
+    constant, allowing TRT to infer all output shapes at compile time.
+
+    When ``n_static`` is None a dynamic N profile is used (legacy; kept for
+    reference but TRT 10.x still produces ForeignNodes for this path).
     """
     try:
         import torch_tensorrt
@@ -1412,10 +1505,11 @@ def _try_trt_decoder(
     os.makedirs(_TRT_CACHE_DIR, exist_ok=True)
     dtype_tag = {torch.float32: "fp32", torch.float16: "fp16", torch.bfloat16: "bf16"}.get(dtype, "fp32")
     sm = torch.cuda.get_device_capability(torch.device(device))
-    # Include num_tokens in the cache key: it determines the min/opt shape profile.
+    # Cache key encodes N: static engines use "nNNN", dynamic use "dyn".
+    n_tag = f"n{n_static}" if n_static is not None else f"dyn_tok{_num_tokens}"
     trt_path = os.path.join(
         _TRT_CACHE_DIR,
-        f"sam2_decoder_sm{sm[0]}{sm[1]}_{dtype_tag}_tok{_num_tokens}.ep",
+        f"sam2_decoder_sm{sm[0]}{sm[1]}_{dtype_tag}_{n_tag}.ep",
     )
 
     if os.path.exists(trt_path):
@@ -1427,13 +1521,14 @@ def _try_trt_decoder(
         except Exception as e:
             print(f"[TRT] Failed to load cached decoder ({e}); recompiling...")
 
-    print("[TRT] Compiling SAM2 decoder with TensorRT (first run ~2-5 min)...")
-
     # T=1: the SAM2 prompt encoder outputs one 256-d embedding per prompt slot.
     T = 1
-    _N_min = _num_tokens            # 1 class
-    _N_opt = min(5 * _num_tokens, max_n_prompts)   # 5 classes (typical)
-    _N_max = max_n_prompts          # generous upper bound
+    _N_export = n_static if n_static is not None else min(5 * _num_tokens, max_n_prompts)
+
+    if n_static is not None:
+        print(f"[TRT] Compiling SAM2 decoder with TensorRT (static N={n_static}, ~2-5 min)...")
+    else:
+        print("[TRT] Compiling SAM2 decoder with TensorRT (dynamic N, ~2-5 min)...")
 
     # Jetson unified-memory workspace; _try_trt_decoder is only called from
     # get_trt_decoder() when _on_jetson is True, but mirror encoder structure for consistency.
@@ -1447,33 +1542,41 @@ def _try_trt_decoder(
         _workspace = 4 * 1024 ** 3
 
     _dev = torch.device(device)
-    eg_image_emb   = torch.zeros(1,       256,  64,  64, dtype=dtype, device=_dev)
-    eg_image_pe    = torch.zeros(1,       256,  64,  64, dtype=dtype, device=_dev)
-    eg_sparse_emb  = torch.zeros(_N_opt,  T,   256,      dtype=dtype, device=_dev)
-    eg_high_res_s0 = torch.zeros(1,       32,  256, 256, dtype=dtype, device=_dev)
-    eg_high_res_s1 = torch.zeros(1,       64,  128, 128, dtype=dtype, device=_dev)
+    eg_image_emb   = torch.zeros(1,         256,  64,  64, dtype=dtype, device=_dev)
+    eg_image_pe    = torch.zeros(1,         256,  64,  64, dtype=dtype, device=_dev)
+    eg_sparse_emb  = torch.zeros(_N_export, T,   256,      dtype=dtype, device=_dev)
+    eg_high_res_s0 = torch.zeros(1,         32,  256, 256, dtype=dtype, device=_dev)
+    eg_high_res_s1 = torch.zeros(1,         64,  128, 128, dtype=dtype, device=_dev)
 
     try:
-        from torch.export import Dim
-
-        # N is the only dynamic dimension: vocab_size × num_tokens.
-        # T=1, all spatial dims and channel dims are static.
-        _N_dim = Dim("N", min=_N_min, max=_N_max)
-
         with torch.no_grad():
-            exported = torch.export.export(
-                wrapper,
-                args=(eg_image_emb, eg_image_pe, eg_sparse_emb,
-                      eg_high_res_s0, eg_high_res_s1),
-                dynamic_shapes={
-                    "image_embeddings": {},            # [1, 256, 64, 64] — static
-                    "image_pe":         {},            # [1, 256, 64, 64] — static
-                    "sparse_embeddings": {0: _N_dim},  # [N, 1, 256] — N dynamic
-                    "high_res_s0":      {},            # [1, 32, 256, 256] — static
-                    "high_res_s1":      {},            # [1, 64, 128, 128] — static
-                },
-                strict=False,
-            )
+            if n_static is not None:
+                # Static export: no dynamic_shapes — all dims are constants at compile time.
+                # This eliminates the ForeignNode caused by dynamic N propagating through
+                # the cross-attention expand + slice chain inside TwoWayTransformer.
+                exported = torch.export.export(
+                    wrapper,
+                    args=(eg_image_emb, eg_image_pe, eg_sparse_emb,
+                          eg_high_res_s0, eg_high_res_s1),
+                    strict=False,
+                )
+            else:
+                # Dynamic export: N is a symbolic dimension (legacy path).
+                from torch.export import Dim
+                _N_dim = Dim("N", min=_num_tokens, max=max_n_prompts)
+                exported = torch.export.export(
+                    wrapper,
+                    args=(eg_image_emb, eg_image_pe, eg_sparse_emb,
+                          eg_high_res_s0, eg_high_res_s1),
+                    dynamic_shapes={
+                        "image_embeddings":  {},
+                        "image_pe":          {},
+                        "sparse_embeddings": {0: _N_dim},
+                        "high_res_s0":       {},
+                        "high_res_s1":       {},
+                    },
+                    strict=False,
+                )
 
         # Same assert-node pre-strip as in get_trt_encoder (see comment there).
         _assert_targets_dec = {
@@ -1502,21 +1605,31 @@ def _try_trt_decoder(
                 pass
             print(f"[TRT] Pre-stripped {len(_nodes_to_strip_dec)} assert nodes from decoder graph")
 
+        # Same enabled_precisions restriction as encoder (see comment there).
+        _dec_precision = {} if dtype != torch.float32 else {"enabled_precisions": {torch.float32}}
+
+        if n_static is not None:
+            _sparse_input = torch_tensorrt.Input(shape=[n_static, T, 256], dtype=dtype)
+        else:
+            _N_min = _num_tokens
+            _N_opt = min(5 * _num_tokens, max_n_prompts)
+            _sparse_input = torch_tensorrt.Input(
+                min_shape=[_N_min, T, 256],
+                opt_shape=[_N_opt, T, 256],
+                max_shape=[max_n_prompts, T, 256],
+                dtype=dtype,
+            )
+
         trt_decoder = torch_tensorrt.dynamo.compile(
             exported,
             inputs=[
                 torch_tensorrt.Input(shape=[1, 256, 64, 64], dtype=dtype),
                 torch_tensorrt.Input(shape=[1, 256, 64, 64], dtype=dtype),
-                torch_tensorrt.Input(
-                    min_shape=[_N_min, T, 256],
-                    opt_shape=[_N_opt, T, 256],
-                    max_shape=[_N_max, T, 256],
-                    dtype=dtype,
-                ),
+                _sparse_input,
                 torch_tensorrt.Input(shape=[1, 32, 256, 256], dtype=dtype),
                 torch_tensorrt.Input(shape=[1, 64, 128, 128], dtype=dtype),
             ],
-            enabled_precisions={dtype},
+            **_dec_precision,
             truncate_double=True,
             device=_dev,
             workspace_size=_workspace,

@@ -463,11 +463,12 @@ class OpenWorldSAM2(nn.Module):
                     reshaped_batch_feat.unsqueeze(0),  # Add batch dimension [1, num_tokens, embedding_dim]
                     img_embed
                 )
-                # Remove batch dimension
+                # Remove batch dimension: [1, N, D] → [N, D]
                 enhanced_batch_feat_with_tokens = enhanced_batch_feat_with_tokens.squeeze(0)
 
-                # Reshape back to original shape if needed
-                if batch_feat_with_tokens.dim() == 2:
+                # Always restore to 3D [N, T, D] matching original_batch_feat_with_tokens.
+                # Without this, [100, D] + [100, 1, D] broadcasts to [100, 100, D] — wrong T.
+                if enhanced_batch_feat_with_tokens.dim() < original_batch_feat_with_tokens.dim():
                     enhanced_batch_feat_with_tokens = enhanced_batch_feat_with_tokens.unsqueeze(1)
 
                 # Skip connection
