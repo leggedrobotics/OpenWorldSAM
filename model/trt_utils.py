@@ -1445,12 +1445,18 @@ def get_trt_decoder(
         f"LayerNorm2d×{n_ln}, TwoWayTransformer×{n_transformer}"
     )
 
-    # On Jetson, attempt static-N TRT compilation first.
-    # Static N eliminates the ForeignNode caused by dynamic N propagating through
-    # the TwoWayTransformer expand+slice chain.  OWSAM_NUM_CLASSES × OWSAM_NUM_TOKENS
-    # sets the fixed N; the torch.compile fallback handles any other vocab size.
+    # On Jetson, optionally attempt static-N TRT compilation.
+    # The static-N TRT engine was originally compiled assuming the sparse-embedding
+    # sequence length is T=1 (matching a `fixed` cross-attention path in
+    # open_world_sam2.py).  The trained OWSAM weights actually rely on a T=N skip
+    # connection broadcast inside the cross-attention block, so the model's real
+    # runtime input is `[N, N, D]`, not `[N, 1, D]`.  Running the T=1 engine with
+    # T=N input crashes with a shape mismatch, and rebuilding the engine for
+    # T=N inflates the transformer sequence length from 6 to (6 + N) with no
+    # correctness benefit.  Opt-in via OWSAM_USE_TRT_DECODER=1 only if you have
+    # separately rebuilt the cache for the current model shape.
     _on_jetson = os.path.isfile("/etc/nv_tegra_release")
-    if _on_jetson:
+    if _on_jetson and os.environ.get("OWSAM_USE_TRT_DECODER", "0") == "1":
         try:
             _n_cls = int(os.environ.get("OWSAM_NUM_CLASSES", "5"))
             _n_tok = int(os.environ.get("OWSAM_NUM_TOKENS", "20"))
