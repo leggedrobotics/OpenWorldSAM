@@ -419,6 +419,45 @@ def _make_locks_picklable() -> None:
             pass
 
 
+class _CudagraphTLSWrapper(torch.nn.Module):
+    """Initialise CUDA graph tree-manager TLS on every calling thread.
+
+    ``torch.compile`` with ``mode='default'`` (inductor) or
+    ``backend='cudagraphs'`` uses ``deferred_cudagraphify``, which on the 2nd
+    inference call fires ``cudagraphify`` → ``get_container`` → ``get_obj``,
+    which asserts ``torch._C._is_key_in_tls('tree_manager_containers')``.
+
+    This TLS key is only set on the thread that first triggered the inductor's
+    own ``lazy_init()``.  In a ROS2 multi-threaded executor, subsequent
+    callbacks may run on a *different* thread that has never had this TLS
+    initialised → ``AssertionError`` on every even-numbered inference call.
+
+    Fix: replicate what PyTorch's internal ``lazy_init()`` does — set the two
+    TLS dicts once per thread before the compiled forward runs.  The guard
+    ``_is_key_in_tls`` is an O(1) C-extension call; cost is negligible.
+    """
+
+    def __init__(self, module: torch.nn.Module) -> None:
+        super().__init__()
+        self._module = module
+
+    def forward(self, *args, **kwargs):
+        try:
+            if not torch._C._is_key_in_tls("tree_manager_containers"):
+                from collections import defaultdict
+                torch._C._set_obj_in_tls("tree_manager_containers", dict())
+                torch._C._set_obj_in_tls("tree_manager_ids", defaultdict(None))
+        except Exception:
+            pass
+        return self._module(*args, **kwargs)
+
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self._module, name)
+
+
 class _InductorWithCudagraphsFallback(torch.nn.Module):
     """Wrap a torch.compile(inductor) module; fall back to cudagraphs on the
     first forward pass if inductor compilation fails.
@@ -474,7 +513,15 @@ class _InductorWithCudagraphsFallback(torch.nn.Module):
                 # can surface as TypeError (pickle), AttributeError
                 # (KernelMetadata), or other Triton/inductor-version errors.
                 self._switch_to_cudagraphs(exc)
-        return self._compiled(*args, **kwargs)
+        try:
+            return self._compiled(*args, **kwargs)
+        except Exception as exc2:
+            # cudagraphs backend can fail at runtime for the same reason as
+            # inductor (e.g. CUDA graph TLS not initialised on the calling
+            # thread).  Fall back to eager so the node never hard-crashes.
+            print(f"[compile] cudagraphs runtime also failed ({exc2}); running eager", flush=True)
+            self._compiled = self._original
+            return self._original(*args, **kwargs)
 
     # Proxy attribute access to the wrapped compiled module so that
     # downstream code that reads e.g. module.conv_s0 still works.
@@ -556,6 +603,18 @@ def _torch_compile(module: torch.nn.Module, *, mode: str = "default", fullgraph:
                 _ic.force_disable_caches = True
             if hasattr(_ic, "autotune_local_cache"):
                 _ic.autotune_local_cache = False
+            # Disable CUDA graph capture so deferred_cudagraphify never calls
+            # get_container() / get_obj(), which assert a TLS key
+            # ("tree_manager_containers") that is only set on the thread that
+            # first initialised the CUDA graph tree manager.  ROS2 callback
+            # threads are different threads and don't have this TLS, causing
+            # AssertionError on the 2nd inference call (when deferred capture
+            # fires).  Triton kernel fusion still applies; only the CUDA graph
+            # recording step is skipped.
+            try:
+                _ic.triton.cudagraphs = False
+            except AttributeError:
+                pass
         except Exception:
             pass
         try:
@@ -579,24 +638,24 @@ def _torch_compile(module: torch.nn.Module, *, mode: str = "default", fullgraph:
             # Wrap so that ANY inductor failure on the first forward pass
             # (TypeError, AttributeError, Triton version mismatches, etc.)
             # triggers a transparent recompile with cudagraphs.
-            return _InductorWithCudagraphsFallback(compiled, module, fullgraph)
+            return _CudagraphTLSWrapper(_InductorWithCudagraphsFallback(compiled, module, fullgraph))
         except Exception as e:
             print(f"[compile] inductor failed ({e}); trying cudagraphs", flush=True)
     if _on_jetson:
         try:
             compiled = torch.compile(module, backend="cudagraphs", fullgraph=fullgraph)
             print("[compile] Jetson: using torch.compile(cudagraphs)", flush=True)
-            return compiled
+            return _CudagraphTLSWrapper(compiled)
         except Exception as e:
             print(f"[compile] cudagraphs failed ({e}); running in eager mode", flush=True)
             return module
     if _triton_available():
-        return torch.compile(module, mode=mode, fullgraph=fullgraph)
+        return _CudagraphTLSWrapper(torch.compile(module, mode=mode, fullgraph=fullgraph))
     # Non-Jetson but Triton unavailable — try cudagraphs before giving up.
     try:
         compiled = torch.compile(module, backend="cudagraphs", fullgraph=fullgraph)
         print("[compile] Triton unavailable; using torch.compile(cudagraphs) fallback", flush=True)
-        return compiled
+        return _CudagraphTLSWrapper(compiled)
     except Exception as e:
         print(f"[compile] cudagraphs backend failed ({e}); running in eager mode")
         return module
@@ -941,17 +1000,32 @@ def _two_way_transformer_forward_patched(
     queries = point_embedding
     keys    = image_embedding
 
-    for layer in self.layers:
+    for idx, layer in enumerate(self.layers):
+        # print(
+        #     f"[TRT][2way] before layer {idx}: queries={tuple(queries.shape)}, keys={tuple(keys.shape)}",
+        # )
         queries, keys = layer(
             queries=queries,
             keys=keys,
             query_pe=point_embedding,
             key_pe=image_pe,
         )
+        # print(
+        #     f"[TRT][2way] after layer {idx}: queries={tuple(queries.shape)}, keys={tuple(keys.shape)}",
+        #     flush=True,
+        # )
 
     q = queries + point_embedding
     k = keys + image_pe
+    # print(
+    #     f"[TRT][2way] before final_attn: queries={tuple(queries.shape)}, keys={tuple(keys.shape)}",
+    #     flush=True,
+    # )
     attn_out = self.final_attn_token_to_image(q=q, k=k, v=keys)
+    # print(
+    #     f"[TRT][2way] after final_attn: attn_out={tuple(attn_out.shape)}",
+    #     flush=True,
+    # )
     queries  = queries + attn_out
     queries  = self.norm_final_attn(queries)
     return queries, keys
@@ -973,7 +1047,7 @@ def _patch_two_way_transformer(module: nn.Module) -> int:
 
 
 def _predict_masks_patched(
-    self,
+    self,56
     image_embeddings: torch.Tensor,
     image_pe: torch.Tensor,
     sparse_prompt_embeddings: torch.Tensor,
@@ -1020,7 +1094,16 @@ def _predict_masks_patched(
     pos_src = image_pe
     _, c, h, w = image_embeddings.shape
 
+    # print(
+    #     f"[TRT][predict_masks] before transformer: src={tuple(src.shape)}, pos_src={tuple(pos_src.shape)}, "
+    #     f"tokens={tuple(tokens.shape)}",
+    #     flush=True,
+    # )
     hs, src = self.transformer(src, pos_src, tokens)
+    # print(
+    #     f"[TRT][predict_masks] after transformer: hs={tuple(hs.shape)}, src={tuple(src.shape)}",
+    #     flush=True,
+    # )
     iou_token_out = hs[:, s, :]
     mask_tokens_out = hs[:, s + 1 : (s + 1 + self.num_mask_tokens), :]
 
@@ -1374,12 +1457,23 @@ class _TRTDecoderAdapter(nn.Module):
     ):
         assert high_res_features is not None and len(high_res_features) >= 2, \
             "_TRTDecoderAdapter requires high_res_features (got None)"
+        print(
+            f"[TRT][adapter] before trt_wrapper: image_embeddings={tuple(image_embeddings.shape)}, "
+            f"image_pe={tuple(image_pe.shape)}, sparse_prompt_embeddings={tuple(sparse_prompt_embeddings.shape)}, "
+            f"high_res_s0={tuple(high_res_features[0].shape)}, high_res_s1={tuple(high_res_features[1].shape)}",
+            flush=True,
+        )
         low_res_masks, iou_pred = self.trt_wrapper(
             image_embeddings,
             image_pe,
             sparse_prompt_embeddings,
             high_res_features[0],
             high_res_features[1],
+        )
+        print(
+            f"[TRT][adapter] after trt_wrapper: low_res_masks={tuple(low_res_masks.shape)}, "
+            f"iou_pred={tuple(iou_pred.shape)}",
+            flush=True,
         )
         # Return 4-tuple matching the original MaskDecoder.forward() signature.
         # Downstream code in open_world_sam2.py only uses the first two outputs.
@@ -1445,12 +1539,18 @@ def get_trt_decoder(
         f"LayerNorm2d×{n_ln}, TwoWayTransformer×{n_transformer}"
     )
 
-    # On Jetson, attempt static-N TRT compilation first.
-    # Static N eliminates the ForeignNode caused by dynamic N propagating through
-    # the TwoWayTransformer expand+slice chain.  OWSAM_NUM_CLASSES × OWSAM_NUM_TOKENS
-    # sets the fixed N; the torch.compile fallback handles any other vocab size.
+    # On Jetson, optionally attempt static-N TRT compilation.
+    # The static-N TRT engine was originally compiled assuming the sparse-embedding
+    # sequence length is T=1 (matching a `fixed` cross-attention path in
+    # open_world_sam2.py).  The trained OWSAM weights actually rely on a T=N skip
+    # connection broadcast inside the cross-attention block, so the model's real
+    # runtime input is `[N, N, D]`, not `[N, 1, D]`.  Running the T=1 engine with
+    # T=N input crashes with a shape mismatch, and rebuilding the engine for
+    # T=N inflates the transformer sequence length from 6 to (6 + N) with no
+    # correctness benefit.  Opt-in via OWSAM_USE_TRT_DECODER=1 only if you have
+    # separately rebuilt the cache for the current model shape.
     _on_jetson = os.path.isfile("/etc/nv_tegra_release")
-    if _on_jetson:
+    if _on_jetson and os.environ.get("OWSAM_USE_TRT_DECODER", "0") == "1":
         try:
             _n_cls = int(os.environ.get("OWSAM_NUM_CLASSES", "5"))
             _n_tok = int(os.environ.get("OWSAM_NUM_TOKENS", "20"))

@@ -463,15 +463,21 @@ class OpenWorldSAM2(nn.Module):
                     reshaped_batch_feat.unsqueeze(0),  # Add batch dimension [1, num_tokens, embedding_dim]
                     img_embed
                 )
-                # Remove batch dimension: [1, N, D] → [N, D]
+                # Remove batch dimension
                 enhanced_batch_feat_with_tokens = enhanced_batch_feat_with_tokens.squeeze(0)
 
-                # Always restore to 3D [N, T, D] matching original_batch_feat_with_tokens.
-                # Without this, [100, D] + [100, 1, D] broadcasts to [100, 100, D] — wrong T.
-                if enhanced_batch_feat_with_tokens.dim() < original_batch_feat_with_tokens.dim():
+                # The condition below is intentionally left as `dim() == 2` even though
+                # `batch_feat_with_tokens` is always 3D at this point. This matches the
+                # code path the OWSAM weights were trained under: the skip connection
+                # `[N, 1, D] + [N, D]` broadcasts to `[N, N, D]`, producing N-token sparse
+                # embeddings per prompt rather than 1. The trained SAM prompt encoder and
+                # mask decoder rely on this T=N structure, and changing it (e.g. forcing
+                # T=1) causes the per-class softmax scores to collapse toward uniform,
+                # destroying segmentation quality.
+                if batch_feat_with_tokens.dim() == 2:
                     enhanced_batch_feat_with_tokens = enhanced_batch_feat_with_tokens.unsqueeze(1)
 
-                # Skip connection
+                # Skip connection (deliberate broadcast: [N, 1, D] + [N, D] -> [N, N, D])
                 batch_feat_with_tokens = original_batch_feat_with_tokens + enhanced_batch_feat_with_tokens
 
             # print(f"Batch feat with tokens shape: {batch_feat_with_tokens.shape}")
