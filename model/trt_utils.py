@@ -1535,8 +1535,12 @@ def _try_trt_decoder(
         except Exception as e:
             print(f"[TRT] Failed to load cached decoder ({e}); recompiling...")
 
-    # T=1: the SAM2 prompt encoder outputs one 256-d embedding per prompt slot.
-    T = 1
+    # Sequence length T of sparse_prompt_embeddings [N, T, 256].
+    # With the restored T=N cross-attention broadcast in open_world_sam2.py
+    # (`[N,1,D] + [N,D] -> [N,N,D]`), the SAM2 prompt encoder emits T == N, not 1.
+    # The static engine must be exported for that runtime shape, otherwise it
+    # mismatches at inference.  (Legacy dynamic path keeps T=1.)
+    T = n_static if n_static is not None else 1
     _N_export = n_static if n_static is not None else min(5 * _num_tokens, max_n_prompts)
 
     if n_static is not None:
