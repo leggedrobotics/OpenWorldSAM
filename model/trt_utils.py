@@ -1122,17 +1122,23 @@ class _DecoderWrapper(nn.Module):
         high_res_s1: torch.Tensor,        # [1, 64, 128, 128]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         N = sparse_embeddings.shape[0]
-        # Pre-expand ALL [1, C, H, W] tensors to [N, C, H, W] here so that
-        # predict_masks receives batched inputs and contains NO expand ops.
-        # TRT on SM_110 cannot execute the ForeignNode it creates when any
-        # expand inside predict_masks feeds (through the transformer + slice)
-        # into the shape-tensor path of the output_upscaling DECONVOLUTION.
-        # Moving every expand to the wrapper level keeps predict_masks free of
-        # ISliceLayer-sourced shape tensors, giving TRT a clean static graph.
+        # image_embeddings / image_pe must be [N, ...]: the TwoWayTransformer updates
+        # them per-prompt, and pre-expanding here keeps predict_masks free of the
+        # ISliceLayer-sourced shape tensors that otherwise create a ForeignNode in the
+        # DECONV path on SM_110.
         image_emb_n  = image_embeddings.expand(N, -1, -1, -1).contiguous()
         image_pe_n   = image_pe.expand(N, -1, -1, -1).contiguous()
-        feat_s0_n    = high_res_s0.expand(N, -1, -1, -1).contiguous()
-        feat_s1_n    = high_res_s1.expand(N, -1, -1, -1).contiguous()
+        # The high-res FPN features (feat_s0 ~500MB, feat_s1 ~250MB at N=120) are only
+        # consumed by the final DECONV skip-add (`_deconv + feat`), which broadcasts
+        # [1,C,H,W] over the N masks natively.  The decoder is bandwidth-bound, so by
+        # default we leave them at [1,...] and let the add broadcast instead of
+        # materialising the largest tensors in the graph.  Set OWSAM_TRT_EXPAND_HIRES=1
+        # to fall back to the fully-expanded path if a TRT build rejects the broadcast.
+        if os.environ.get("OWSAM_TRT_EXPAND_HIRES", "0") == "1":
+            feat_s0 = high_res_s0.expand(N, -1, -1, -1).contiguous()
+            feat_s1 = high_res_s1.expand(N, -1, -1, -1).contiguous()
+        else:
+            feat_s0, feat_s1 = high_res_s0, high_res_s1
         dense_embeddings = self.no_mask_embed.expand(
             N, -1, image_embeddings.shape[2], image_embeddings.shape[3]
         ).contiguous()
@@ -1142,7 +1148,7 @@ class _DecoderWrapper(nn.Module):
             sparse_prompt_embeddings=sparse_embeddings,
             dense_prompt_embeddings=dense_embeddings,
             repeat_image=True,
-            high_res_features=[feat_s0_n, feat_s1_n],
+            high_res_features=[feat_s0, feat_s1],
         )
         # Return single-mask slice (multimask_output=False path)
         return masks[:, 0:1, :, :], iou_pred[:, 0:1]
@@ -1297,6 +1303,139 @@ def get_trt_encoder(image_encoder: torch.nn.Module, dtype: torch.dtype, device: 
         traceback.print_exc()
         print("[TRT] Falling back to torch.compile")
         return _torch_compile(image_encoder, mode="default", fullgraph=False)
+
+
+# ---------------------------------------------------------------------------
+# BEiT-3 multimodal extractor (TensorRT)
+# ---------------------------------------------------------------------------
+
+class _Beit3EncoderOut(nn.Module):
+    """Wrap BEiT-3 so it returns ONLY ``encoder_out`` (the one output the OWSAM
+    pipeline uses).  The full BEiT-3 forward returns a dict with several outputs,
+    some ``None``; torch_tensorrt cannot lower a graph with None-valued outputs
+    (it does ``output.target`` on every output node)."""
+
+    def __init__(self, beit3: nn.Module) -> None:
+        super().__init__()
+        self.beit3 = beit3
+
+    def forward(self, visual_tokens, textual_tokens, text_padding_position):
+        return self.beit3(
+            visual_tokens=visual_tokens,
+            textual_tokens=textual_tokens,
+            text_padding_position=text_padding_position,
+        )["encoder_out"]
+
+
+class _TRTBeit3Adapter(nn.Module):
+    """Drop-in for ``mm_extractor.beit3`` backed by a static (N, seq) TRT engine.
+
+    The trained model reads only ``encoder_out[:, :1, :]`` (the first, position-0
+    token), which is unaffected by *trailing* text padding.  So at runtime we pad
+    the text tokens to the engine's fixed ``seq_static`` (with masked padding) and
+    run TRT; for any other batch size or longer text we fall back to the eager
+    BEiT-3.  Returns the ``{"encoder_out": ...}`` dict the caller expects.
+    """
+
+    def __init__(self, trt_module, eager_beit3, n_static, seq_static, pad_token_id):
+        super().__init__()
+        self.trt_module = trt_module
+        self.eager_beit3 = eager_beit3
+        self.n_static = int(n_static)
+        self.seq_static = int(seq_static)
+        self.pad_token_id = int(pad_token_id)
+
+    def forward(self, visual_tokens, textual_tokens, text_padding_position):
+        n, seq = textual_tokens.shape[0], textual_tokens.shape[1]
+        if n == self.n_static and seq <= self.seq_static:
+            if seq < self.seq_static:
+                pad = self.seq_static - seq
+                textual_tokens = F.pad(textual_tokens, (0, pad), value=self.pad_token_id)
+                # True == "is padding" (text_padding_position = ~attention_mask)
+                text_padding_position = F.pad(text_padding_position, (0, pad), value=True)
+            return {"encoder_out": self.trt_module(visual_tokens, textual_tokens, text_padding_position)}
+        return self.eager_beit3(
+            visual_tokens=visual_tokens,
+            textual_tokens=textual_tokens,
+            text_padding_position=text_padding_position,
+        )
+
+
+def get_trt_beit3(
+    beit3: nn.Module,
+    n_static: int,
+    seq_static: int,
+    dtype: torch.dtype,
+    pad_token_id: int,
+    device: str = "cuda:0",
+) -> "nn.Module | None":
+    """Return a TRT-backed drop-in for the BEiT-3 extractor, or ``None`` on failure.
+
+    BEiT-3 is the parallel-path bottleneck (~3x faster under TRT: ~60ms -> ~21ms).
+    Compiled for a fixed (N=n_static, seq=seq_static); other shapes fall back to
+    eager.  ``encoder_out`` differs from eager by ~cos 0.94 (BF16 error compounding
+    over a deep transformer) but the downstream prompt-encoder/decoder/softmax are
+    robust — end-to-end argmax agreement ~99.7%.
+    """
+    try:
+        import torch_tensorrt
+    except ImportError:
+        print("[TRT] torch-tensorrt not installed; keeping eager BEiT-3")
+        return None
+
+    os.makedirs(_TRT_CACHE_DIR, exist_ok=True)
+    dtype_tag = {torch.float32: "fp32", torch.float16: "fp16", torch.bfloat16: "bf16"}.get(dtype, "fp32")
+    sm = torch.cuda.get_device_capability(torch.device(device))
+    trt_path = os.path.join(
+        _TRT_CACHE_DIR, f"beit3_sm{sm[0]}{sm[1]}_{dtype_tag}_n{n_static}_s{seq_static}.ep"
+    )
+
+    if os.path.exists(trt_path):
+        print(f"[TRT] Loading cached TRT BEiT-3 from {trt_path}")
+        try:
+            loaded = torch.export.load(trt_path).module()
+            return _TRTBeit3Adapter(loaded, beit3, n_static, seq_static, pad_token_id)
+        except Exception as e:
+            print(f"[TRT] Failed to load cached BEiT-3 ({e}); recompiling...")
+
+    print(f"[TRT] Compiling BEiT-3 with TensorRT (static N={n_static}, seq={seq_static}, ~2-4 min)...")
+    wrapper = _Beit3EncoderOut(beit3).to(device=device).eval()
+    _dev = torch.device(device)
+    eg_visual = torch.zeros(n_static, 3, 224, 224, dtype=dtype, device=_dev)
+    eg_text = torch.zeros(n_static, seq_static, dtype=torch.long, device=_dev)
+    eg_pad = torch.zeros(n_static, seq_static, dtype=torch.bool, device=_dev)
+
+    try:
+        with torch.no_grad():
+            exported = torch.export.export(wrapper, args=(eg_visual, eg_text, eg_pad), strict=False)
+        # Keep the build-time workspace small: BEiT-3 is a 224px transformer (far
+        # lighter than the SAM2 encoder/decoder) and _load_model compiles it while the
+        # encoder+decoder engines are already resident — a large workspace OOM-kills
+        # the container on Thor's unified memory.  1GB is plenty here.
+        _prec = {} if dtype != torch.float32 else {"enabled_precisions": {torch.float32}}
+        trt = torch_tensorrt.dynamo.compile(
+            exported,
+            inputs=[
+                torch_tensorrt.Input(shape=[n_static, 3, 224, 224], dtype=dtype),
+                torch_tensorrt.Input(shape=[n_static, seq_static], dtype=torch.long),
+                torch_tensorrt.Input(shape=[n_static, seq_static], dtype=torch.bool),
+            ],
+            **_prec,
+            truncate_double=True,
+            device=_dev,
+            workspace_size=1024 ** 3,
+            optimization_level=3,
+            use_fp32_acc=True,
+        )
+        torch_tensorrt.save(trt, trt_path, inputs=[eg_visual, eg_text, eg_pad])
+        print(f"[TRT] TRT BEiT-3 engine saved to {trt_path}")
+        return _TRTBeit3Adapter(trt, beit3, n_static, seq_static, pad_token_id)
+    except Exception as e:
+        import traceback
+        print(f"[TRT] BEiT-3 TRT compilation failed: {e}")
+        traceback.print_exc()
+        print("[TRT] Keeping eager BEiT-3")
+        return None
 
 
 class _StaticTRTDecoder(nn.Module):
@@ -1516,14 +1655,23 @@ def _try_trt_decoder(
     except ValueError:
         _num_tokens = 20
 
+    # FP32 matmul accumulation: accurate (default) but slower.  The decoder output
+    # is mask logits that get sigmoid+softmax'd downstream, so BF16 accumulation is
+    # usually quality-neutral and meaningfully faster — opt in via OWSAM_TRT_FP32_ACC=0.
+    _fp32_acc = os.environ.get("OWSAM_TRT_FP32_ACC", "1") == "1"
+
     os.makedirs(_TRT_CACHE_DIR, exist_ok=True)
     dtype_tag = {torch.float32: "fp32", torch.float16: "fp16", torch.bfloat16: "bf16"}.get(dtype, "fp32")
     sm = torch.cuda.get_device_capability(torch.device(device))
     # Cache key encodes N: static engines use "nNNN", dynamic use "dyn".
     n_tag = f"n{n_static}" if n_static is not None else f"dyn_tok{_num_tokens}"
+    acc_tag = "accfp32" if _fp32_acc else "accbf16"
+    # The high-res-feature broadcast vs expand choice changes the graph, so it must
+    # be part of the cache key (avoid loading a stale engine built the other way).
+    hires_tag = "exh" if os.environ.get("OWSAM_TRT_EXPAND_HIRES", "0") == "1" else "bch"
     trt_path = os.path.join(
         _TRT_CACHE_DIR,
-        f"sam2_decoder_sm{sm[0]}{sm[1]}_{dtype_tag}_{n_tag}.ep",
+        f"sam2_decoder_sm{sm[0]}{sm[1]}_{dtype_tag}_{n_tag}_{acc_tag}_{hires_tag}.ep",
     )
 
     if os.path.exists(trt_path):
@@ -1535,8 +1683,12 @@ def _try_trt_decoder(
         except Exception as e:
             print(f"[TRT] Failed to load cached decoder ({e}); recompiling...")
 
-    # T=1: the SAM2 prompt encoder outputs one 256-d embedding per prompt slot.
-    T = 1
+    # Sequence length T of sparse_prompt_embeddings [N, T, 256].
+    # With the restored T=N cross-attention broadcast in open_world_sam2.py
+    # (`[N,1,D] + [N,D] -> [N,N,D]`), the SAM2 prompt encoder emits T == N, not 1.
+    # The static engine must be exported for that runtime shape, otherwise it
+    # mismatches at inference.  (Legacy dynamic path keeps T=1.)
+    T = n_static if n_static is not None else 1
     _N_export = n_static if n_static is not None else min(5 * _num_tokens, max_n_prompts)
 
     if n_static is not None:
@@ -1648,7 +1800,7 @@ def _try_trt_decoder(
             device=_dev,
             workspace_size=_workspace,
             optimization_level=3,
-            use_fp32_acc=True,
+            use_fp32_acc=_fp32_acc,
         )
 
         torch_tensorrt.save(

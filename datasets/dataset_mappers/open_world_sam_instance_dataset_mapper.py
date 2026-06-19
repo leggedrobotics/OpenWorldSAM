@@ -66,16 +66,25 @@ def sam_preprocess(
         x: np.ndarray,
         pixel_mean=torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1),
         pixel_std=torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1),
-        img_size=1024) -> torch.Tensor:
+        img_size=1024,
+        device=None) -> torch.Tensor:
     '''
     preprocess of Segment Anything Model, including scaling, normalization and padding.
     input: ndarray
     output: torch.Tensor
+
+    The 1024^2 bilinear resize is the dominant CPU cost in the mapper; pass ``device``
+    (the model's CUDA device at inference) to run it on the GPU instead. Same op, just
+    a different device, so the result is numerically equivalent.
     '''
     assert img_size == 1024, \
         " SAM receive images of size 1024^2, don't change this setting unless you're sure that your employed model works well with another size."
 
-    x = torch.as_tensor(np.ascontiguousarray(x.transpose(2, 0, 1)))
+    x = torch.as_tensor(np.ascontiguousarray(x.transpose(2, 0, 1))).float()
+    if device is not None and str(device) != "cpu":
+        x = x.to(device)
+        pixel_mean = pixel_mean.to(device)
+        pixel_std = pixel_std.to(device)
     x = F.interpolate(x.unsqueeze(0), (img_size, img_size), mode="bilinear", align_corners=False).squeeze(0)
     x = (x - pixel_mean) / (pixel_std + 0.000001)
 
@@ -145,6 +154,7 @@ class OpenWorldSAM2InstanceDatasetMapper:
             image_format,
             text_classes=None,
             tokenizer=None,
+            preproc_device=None,
     ):
         """
         NOTE: this interface is experimental.
@@ -163,6 +173,8 @@ class OpenWorldSAM2InstanceDatasetMapper:
         self.is_train = is_train
         self.text_classes = text_classes
         self.tokenizer = tokenizer
+        # Device for the (GPU-accelerated) SAM resize at inference; None = CPU.
+        self.preproc_device = preproc_device
 
     @classmethod
     def from_config(cls, cfg, is_train=True):
@@ -181,6 +193,9 @@ class OpenWorldSAM2InstanceDatasetMapper:
             "image_format": cfg.INPUT.FORMAT,
             "text_classes": text_classes,
             "tokenizer": tokenizer,
+            # Run the SAM 1024^2 resize on the model's device at inference (GPU).
+            # Left on CPU for training so dataloader workers don't touch CUDA.
+            "preproc_device": (cfg.MODEL.DEVICE if not is_train else None),
         }
         return ret
 
@@ -194,7 +209,16 @@ class OpenWorldSAM2InstanceDatasetMapper:
         """
 
         dataset_dict = copy.deepcopy(dataset_dict)  # it will be modified by code below
-        image = utils.read_image(dataset_dict["file_name"], format=self.img_format)
+        # Fast path: use an in-memory RGB array if the caller provided one, avoiding a
+        # temp-JPEG round-trip through disk (slow + lossy re-compression).
+        _inmem = dataset_dict.pop("image_array", None)
+        if _inmem is not None:
+            image = _inmem  # H x W x C, RGB, uint8
+            if self.img_format == "BGR":
+                image = image[:, :, ::-1]
+            image = np.ascontiguousarray(image)
+        else:
+            image = utils.read_image(dataset_dict["file_name"], format=self.img_format)
         utils.check_image_size(dataset_dict, image)
 
         # Generate padding mask
@@ -206,7 +230,7 @@ class OpenWorldSAM2InstanceDatasetMapper:
         image_shape = image.shape[:2]  # h, w
 
         # Preprocess the image for SAM2 and BEIT-3
-        dataset_dict["image"] = sam_preprocess(image)
+        dataset_dict["image"] = sam_preprocess(image, device=getattr(self, "preproc_device", None))
         dataset_dict["evf_image"] = beit3_preprocess(image)
         dataset_dict["padding_mask"] = torch.as_tensor(np.ascontiguousarray(padding_mask))
         # Set a default prompt immediately
