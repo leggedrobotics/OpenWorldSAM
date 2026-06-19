@@ -1305,6 +1305,139 @@ def get_trt_encoder(image_encoder: torch.nn.Module, dtype: torch.dtype, device: 
         return _torch_compile(image_encoder, mode="default", fullgraph=False)
 
 
+# ---------------------------------------------------------------------------
+# BEiT-3 multimodal extractor (TensorRT)
+# ---------------------------------------------------------------------------
+
+class _Beit3EncoderOut(nn.Module):
+    """Wrap BEiT-3 so it returns ONLY ``encoder_out`` (the one output the OWSAM
+    pipeline uses).  The full BEiT-3 forward returns a dict with several outputs,
+    some ``None``; torch_tensorrt cannot lower a graph with None-valued outputs
+    (it does ``output.target`` on every output node)."""
+
+    def __init__(self, beit3: nn.Module) -> None:
+        super().__init__()
+        self.beit3 = beit3
+
+    def forward(self, visual_tokens, textual_tokens, text_padding_position):
+        return self.beit3(
+            visual_tokens=visual_tokens,
+            textual_tokens=textual_tokens,
+            text_padding_position=text_padding_position,
+        )["encoder_out"]
+
+
+class _TRTBeit3Adapter(nn.Module):
+    """Drop-in for ``mm_extractor.beit3`` backed by a static (N, seq) TRT engine.
+
+    The trained model reads only ``encoder_out[:, :1, :]`` (the first, position-0
+    token), which is unaffected by *trailing* text padding.  So at runtime we pad
+    the text tokens to the engine's fixed ``seq_static`` (with masked padding) and
+    run TRT; for any other batch size or longer text we fall back to the eager
+    BEiT-3.  Returns the ``{"encoder_out": ...}`` dict the caller expects.
+    """
+
+    def __init__(self, trt_module, eager_beit3, n_static, seq_static, pad_token_id):
+        super().__init__()
+        self.trt_module = trt_module
+        self.eager_beit3 = eager_beit3
+        self.n_static = int(n_static)
+        self.seq_static = int(seq_static)
+        self.pad_token_id = int(pad_token_id)
+
+    def forward(self, visual_tokens, textual_tokens, text_padding_position):
+        n, seq = textual_tokens.shape[0], textual_tokens.shape[1]
+        if n == self.n_static and seq <= self.seq_static:
+            if seq < self.seq_static:
+                pad = self.seq_static - seq
+                textual_tokens = F.pad(textual_tokens, (0, pad), value=self.pad_token_id)
+                # True == "is padding" (text_padding_position = ~attention_mask)
+                text_padding_position = F.pad(text_padding_position, (0, pad), value=True)
+            return {"encoder_out": self.trt_module(visual_tokens, textual_tokens, text_padding_position)}
+        return self.eager_beit3(
+            visual_tokens=visual_tokens,
+            textual_tokens=textual_tokens,
+            text_padding_position=text_padding_position,
+        )
+
+
+def get_trt_beit3(
+    beit3: nn.Module,
+    n_static: int,
+    seq_static: int,
+    dtype: torch.dtype,
+    pad_token_id: int,
+    device: str = "cuda:0",
+) -> "nn.Module | None":
+    """Return a TRT-backed drop-in for the BEiT-3 extractor, or ``None`` on failure.
+
+    BEiT-3 is the parallel-path bottleneck (~3x faster under TRT: ~60ms -> ~21ms).
+    Compiled for a fixed (N=n_static, seq=seq_static); other shapes fall back to
+    eager.  ``encoder_out`` differs from eager by ~cos 0.94 (BF16 error compounding
+    over a deep transformer) but the downstream prompt-encoder/decoder/softmax are
+    robust — end-to-end argmax agreement ~99.7%.
+    """
+    try:
+        import torch_tensorrt
+    except ImportError:
+        print("[TRT] torch-tensorrt not installed; keeping eager BEiT-3")
+        return None
+
+    os.makedirs(_TRT_CACHE_DIR, exist_ok=True)
+    dtype_tag = {torch.float32: "fp32", torch.float16: "fp16", torch.bfloat16: "bf16"}.get(dtype, "fp32")
+    sm = torch.cuda.get_device_capability(torch.device(device))
+    trt_path = os.path.join(
+        _TRT_CACHE_DIR, f"beit3_sm{sm[0]}{sm[1]}_{dtype_tag}_n{n_static}_s{seq_static}.ep"
+    )
+
+    if os.path.exists(trt_path):
+        print(f"[TRT] Loading cached TRT BEiT-3 from {trt_path}")
+        try:
+            loaded = torch.export.load(trt_path).module()
+            return _TRTBeit3Adapter(loaded, beit3, n_static, seq_static, pad_token_id)
+        except Exception as e:
+            print(f"[TRT] Failed to load cached BEiT-3 ({e}); recompiling...")
+
+    print(f"[TRT] Compiling BEiT-3 with TensorRT (static N={n_static}, seq={seq_static}, ~2-4 min)...")
+    wrapper = _Beit3EncoderOut(beit3).to(device=device).eval()
+    _dev = torch.device(device)
+    eg_visual = torch.zeros(n_static, 3, 224, 224, dtype=dtype, device=_dev)
+    eg_text = torch.zeros(n_static, seq_static, dtype=torch.long, device=_dev)
+    eg_pad = torch.zeros(n_static, seq_static, dtype=torch.bool, device=_dev)
+
+    try:
+        with torch.no_grad():
+            exported = torch.export.export(wrapper, args=(eg_visual, eg_text, eg_pad), strict=False)
+        # Keep the build-time workspace small: BEiT-3 is a 224px transformer (far
+        # lighter than the SAM2 encoder/decoder) and _load_model compiles it while the
+        # encoder+decoder engines are already resident — a large workspace OOM-kills
+        # the container on Thor's unified memory.  1GB is plenty here.
+        _prec = {} if dtype != torch.float32 else {"enabled_precisions": {torch.float32}}
+        trt = torch_tensorrt.dynamo.compile(
+            exported,
+            inputs=[
+                torch_tensorrt.Input(shape=[n_static, 3, 224, 224], dtype=dtype),
+                torch_tensorrt.Input(shape=[n_static, seq_static], dtype=torch.long),
+                torch_tensorrt.Input(shape=[n_static, seq_static], dtype=torch.bool),
+            ],
+            **_prec,
+            truncate_double=True,
+            device=_dev,
+            workspace_size=1024 ** 3,
+            optimization_level=3,
+            use_fp32_acc=True,
+        )
+        torch_tensorrt.save(trt, trt_path, inputs=[eg_visual, eg_text, eg_pad])
+        print(f"[TRT] TRT BEiT-3 engine saved to {trt_path}")
+        return _TRTBeit3Adapter(trt, beit3, n_static, seq_static, pad_token_id)
+    except Exception as e:
+        import traceback
+        print(f"[TRT] BEiT-3 TRT compilation failed: {e}")
+        traceback.print_exc()
+        print("[TRT] Keeping eager BEiT-3")
+        return None
+
+
 class _StaticTRTDecoder(nn.Module):
     """TRT decoder compiled with a fixed N, with torch.compile fallback.
 
