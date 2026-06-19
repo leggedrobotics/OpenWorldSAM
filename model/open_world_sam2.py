@@ -574,9 +574,18 @@ class OpenWorldSAM2(nn.Module):
 
                 # Proceed with postprocessing using the refined masks
                 t0 = time.perf_counter()
-                pred_masks = self.postprocess_masks(low_res_masks, orig_hw=original_size_list[img_idx])
 
                 processed_results.append({})
+
+                # High-res per-query masks are only needed by the refer/instance/panoptic
+                # heads. Interpolating all N query masks ([N,1,256,256] -> [N,1,H,W]) to full
+                # resolution is the dominant postprocess cost (N >> num_classes). The semantic
+                # head can instead run the sigmoid+einsum at 256x256 and upsample only the
+                # C-channel result — numerically near-identical and much cheaper. So compute
+                # the high-res masks only when a head that needs them is enabled.
+                _need_hires_masks = self.refer_on or self.instance_on or self.panoptic_on
+                if _need_hires_masks:
+                    pred_masks = self.postprocess_masks(low_res_masks, orig_hw=original_size_list[img_idx])
 
                 if self.refer_on:
                     # Get referring expression masks
@@ -605,15 +614,21 @@ class OpenWorldSAM2(nn.Module):
                     # Prepare inputs for semantic inference
                     # Create one-hot class scores
                     num_classes = len(self.metadata.stuff_classes)
-                    mask_cls = torch.zeros((pred_masks.shape[0], num_classes + 1),
+                    mask_cls = torch.zeros((low_res_masks.shape[0], num_classes + 1),
                                            device=self.device)  # +1 for background
 
                     # Fill in class scores based on class labels and prediction scores
                     for idx, (cls_id, score) in enumerate(zip(class_labels, pred_logits.squeeze(1))):
                         mask_cls[idx, cls_id] = score
 
-                    # Generate semantic segmentation
-                    sem_seg = self.semantic_inference(mask_cls, pred_masks, keep_sem_bgd=False)
+                    # Semantic inference at low res, then upsample the C-channel result.
+                    sem_seg_low = self.semantic_inference(mask_cls, low_res_masks, keep_sem_bgd=False)
+                    sem_seg = F.interpolate(
+                        sem_seg_low.unsqueeze(0),
+                        size=tuple(original_size_list[img_idx]),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(0)
                     processed_results[-1]["sem_seg"] = sem_seg
 
 

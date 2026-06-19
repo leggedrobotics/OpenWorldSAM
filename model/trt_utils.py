@@ -1122,17 +1122,23 @@ class _DecoderWrapper(nn.Module):
         high_res_s1: torch.Tensor,        # [1, 64, 128, 128]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         N = sparse_embeddings.shape[0]
-        # Pre-expand ALL [1, C, H, W] tensors to [N, C, H, W] here so that
-        # predict_masks receives batched inputs and contains NO expand ops.
-        # TRT on SM_110 cannot execute the ForeignNode it creates when any
-        # expand inside predict_masks feeds (through the transformer + slice)
-        # into the shape-tensor path of the output_upscaling DECONVOLUTION.
-        # Moving every expand to the wrapper level keeps predict_masks free of
-        # ISliceLayer-sourced shape tensors, giving TRT a clean static graph.
+        # image_embeddings / image_pe must be [N, ...]: the TwoWayTransformer updates
+        # them per-prompt, and pre-expanding here keeps predict_masks free of the
+        # ISliceLayer-sourced shape tensors that otherwise create a ForeignNode in the
+        # DECONV path on SM_110.
         image_emb_n  = image_embeddings.expand(N, -1, -1, -1).contiguous()
         image_pe_n   = image_pe.expand(N, -1, -1, -1).contiguous()
-        feat_s0_n    = high_res_s0.expand(N, -1, -1, -1).contiguous()
-        feat_s1_n    = high_res_s1.expand(N, -1, -1, -1).contiguous()
+        # The high-res FPN features (feat_s0 ~500MB, feat_s1 ~250MB at N=120) are only
+        # consumed by the final DECONV skip-add (`_deconv + feat`), which broadcasts
+        # [1,C,H,W] over the N masks natively.  The decoder is bandwidth-bound, so by
+        # default we leave them at [1,...] and let the add broadcast instead of
+        # materialising the largest tensors in the graph.  Set OWSAM_TRT_EXPAND_HIRES=1
+        # to fall back to the fully-expanded path if a TRT build rejects the broadcast.
+        if os.environ.get("OWSAM_TRT_EXPAND_HIRES", "0") == "1":
+            feat_s0 = high_res_s0.expand(N, -1, -1, -1).contiguous()
+            feat_s1 = high_res_s1.expand(N, -1, -1, -1).contiguous()
+        else:
+            feat_s0, feat_s1 = high_res_s0, high_res_s1
         dense_embeddings = self.no_mask_embed.expand(
             N, -1, image_embeddings.shape[2], image_embeddings.shape[3]
         ).contiguous()
@@ -1142,7 +1148,7 @@ class _DecoderWrapper(nn.Module):
             sparse_prompt_embeddings=sparse_embeddings,
             dense_prompt_embeddings=dense_embeddings,
             repeat_image=True,
-            high_res_features=[feat_s0_n, feat_s1_n],
+            high_res_features=[feat_s0, feat_s1],
         )
         # Return single-mask slice (multimask_output=False path)
         return masks[:, 0:1, :, :], iou_pred[:, 0:1]
@@ -1516,14 +1522,23 @@ def _try_trt_decoder(
     except ValueError:
         _num_tokens = 20
 
+    # FP32 matmul accumulation: accurate (default) but slower.  The decoder output
+    # is mask logits that get sigmoid+softmax'd downstream, so BF16 accumulation is
+    # usually quality-neutral and meaningfully faster — opt in via OWSAM_TRT_FP32_ACC=0.
+    _fp32_acc = os.environ.get("OWSAM_TRT_FP32_ACC", "1") == "1"
+
     os.makedirs(_TRT_CACHE_DIR, exist_ok=True)
     dtype_tag = {torch.float32: "fp32", torch.float16: "fp16", torch.bfloat16: "bf16"}.get(dtype, "fp32")
     sm = torch.cuda.get_device_capability(torch.device(device))
     # Cache key encodes N: static engines use "nNNN", dynamic use "dyn".
     n_tag = f"n{n_static}" if n_static is not None else f"dyn_tok{_num_tokens}"
+    acc_tag = "accfp32" if _fp32_acc else "accbf16"
+    # The high-res-feature broadcast vs expand choice changes the graph, so it must
+    # be part of the cache key (avoid loading a stale engine built the other way).
+    hires_tag = "exh" if os.environ.get("OWSAM_TRT_EXPAND_HIRES", "0") == "1" else "bch"
     trt_path = os.path.join(
         _TRT_CACHE_DIR,
-        f"sam2_decoder_sm{sm[0]}{sm[1]}_{dtype_tag}_{n_tag}.ep",
+        f"sam2_decoder_sm{sm[0]}{sm[1]}_{dtype_tag}_{n_tag}_{acc_tag}_{hires_tag}.ep",
     )
 
     if os.path.exists(trt_path):
@@ -1652,7 +1667,7 @@ def _try_trt_decoder(
             device=_dev,
             workspace_size=_workspace,
             optimization_level=3,
-            use_fp32_acc=True,
+            use_fp32_acc=_fp32_acc,
         )
 
         torch_tensorrt.save(
